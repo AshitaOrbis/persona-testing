@@ -1,0 +1,7 @@
+node_modules/
+dist/
+reports/
+screenshots/
+.env
+.persona-probe.yml
+*.tsbuildinfo

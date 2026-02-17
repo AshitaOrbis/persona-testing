@@ -1,0 +1,37 @@
+{
+  "name": "persona-probe",
+  "version": "0.1.0",
+  "description": "AI persona testing framework. Define user personas, run automated UX testing.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "persona-probe": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "testing",
+    "persona",
+    "ux",
+    "ai",
+    "automation",
+    "playwright"
+  ],
+  "author": "Ashita Orbis",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AshitaOrbis/persona-probe.git"
+  },
+  "dependencies": {
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}
