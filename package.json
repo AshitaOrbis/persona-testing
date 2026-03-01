@@ -1,11 +1,11 @@
 {
-  "name": "persona-probe",
-  "version": "0.1.0",
-  "description": "AI persona testing framework. Define user personas, run automated UX testing.",
+  "name": "persona-testing",
+  "version": "0.2.0",
+  "description": "AI persona testing framework. Define user personas, run automated UX testing with browser automation.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "persona-probe": "dist/index.js"
+    "persona-testing": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -18,15 +18,20 @@
     "ux",
     "ai",
     "automation",
-    "playwright"
+    "playwright",
+    "browser-testing",
+    "llm"
   ],
   "author": "Ashita Orbis",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AshitaOrbis/persona-probe.git"
+    "url": "https://github.com/AshitaOrbis/persona-testing.git"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^4.77.0",
+    "playwright": "^1.49.0",
     "yaml": "^2.6.0"
   },
   "devDependencies": {

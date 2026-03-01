@@ -1,5 +1,5 @@
 /**
- * Persona Probe - Type definitions
+ * Persona Testing - Type definitions
  *
  * Defines the structure of persona definitions, probe results,
  * and configuration.
@@ -61,7 +61,9 @@ export interface ProbeResult {
   critical_bugs: boolean;
   criteria: CriteriaVerdict;
   items: ActionableItem[];
+  screenshots: string[];
   report_markdown: string;
+  report_path?: string;
 }
 
 export interface ProbeConfig {
@@ -71,4 +73,33 @@ export interface ProbeConfig {
   screenshot_dir?: string;
   report_dir?: string;
   api_key?: string;
+  max_iterations?: number;
+}
+
+/** Tool names that the AI can call for browser automation */
+export type ToolName =
+  | "navigate"
+  | "click"
+  | "type"
+  | "hover"
+  | "select_option"
+  | "press_key"
+  | "wait_for_selector"
+  | "screenshot"
+  | "get_outline"
+  | "scroll_to_bottom"
+  | "get_url";
+
+/** A tool call from the AI model */
+export interface ToolCall {
+  id: string;
+  name: ToolName;
+  input: Record<string, unknown>;
+}
+
+/** Result of executing a tool */
+export interface ToolResult {
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
 }

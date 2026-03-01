@@ -1,4 +1,4 @@
-# Persona Probe
+# Persona Testing
 
 AI persona testing framework. Define user personas, run automated UX testing with browser automation, get structured feedback from the perspective of real users.
 
@@ -29,13 +29,13 @@ The persona doesn't know your codebase. It only knows its job title, goals, and 
 
 ```bash
 # 1. Install
-npm install -g persona-probe
+npm install -g persona-testing
 
 # 2. Create a persona
-persona-probe init --name "New User" --output personas/new-user.yml
+persona-testing init --name "New User" --output personas/new-user.yml
 
 # 3. Run a probe
-persona-probe run --persona personas/new-user.yml --url https://your-app.com
+persona-testing run --persona personas/new-user.yml --url https://your-app.com
 
 # 4. Read the report
 cat reports/new-user-2026-02-16.md
@@ -159,10 +159,10 @@ Run multiple personas to test different user perspectives:
 
 ```bash
 # Run all personas in a directory
-persona-probe run --personas personas/ --url https://your-app.com
+persona-testing run --personas personas/ --url https://your-app.com
 
 # Run specific personas
-persona-probe run \
+persona-testing run \
   --persona personas/new-user.yml \
   --persona personas/power-user.yml \
   --persona personas/admin.yml \
@@ -177,7 +177,7 @@ Use the structured JSON output to gate deployments:
 # GitHub Actions example
 - name: Run persona tests
   run: |
-    persona-probe run \
+    persona-testing run \
       --personas personas/ \
       --url ${{ env.STAGING_URL }} \
       --output-dir reports/
@@ -186,7 +186,7 @@ Use the structured JSON output to gate deployments:
 - name: Check readiness
   run: |
     # Fail if any persona scores below 60%
-    persona-probe check --reports reports/ --min-readiness 60
+    persona-testing check --reports reports/ --min-readiness 60
 ```
 
 ## Examples
@@ -219,11 +219,11 @@ The persona definition constrains the AI's behavior: it doesn't know implementat
 
 ```bash
 # Set your AI provider
-export PERSONA_PROBE_PROVIDER=anthropic  # or openai
-export PERSONA_PROBE_API_KEY=your-key
+export PERSONA_TESTING_PROVIDER=anthropic  # or openai
+export PERSONA_TESTING_API_KEY=your-key
 
 # Or use a config file
-cat > .persona-probe.yml << EOF
+cat > .persona-testing.yml << EOF
 provider: anthropic
 model: claude-sonnet-4-5-20250929
 browser: chromium
