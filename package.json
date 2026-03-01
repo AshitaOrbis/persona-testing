@@ -10,7 +10,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx src/parser.test.ts",
+    "test:ai": "claude -p 'run npm test in this project and report the results'"
   },
   "keywords": [
     "testing",
