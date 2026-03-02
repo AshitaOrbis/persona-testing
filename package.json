@@ -1,6 +1,6 @@
 {
   "name": "persona-testing",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "AI persona testing framework. Define user personas, run automated UX testing with browser automation.",
   "type": "module",
   "main": "dist/index.js",
