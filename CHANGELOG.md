@@ -2,6 +2,29 @@
 
 ## 0.3.0 — 2026-06-11
 
+### Follow-up review fixes
+
+A second, independent adversarial review (blind to the first; archived at
+`reviews/fable-followup-2026-06-11.md`) was run against the hardened code.
+Its findings, fixed in this release:
+
+- **Default Anthropic model ID was invalid** (`claude-sonnet-4-5-20250514`
+  spliced the Sonnet 4.5 name onto the Sonnet 4 date). Default runs would
+  404 on the first API call. Now `claude-sonnet-4-5-20250929`.
+- **Origin is now re-checked before every tool call**, not only after
+  click/keypress/navigate — closing the passive-redirect gap (`<meta
+  refresh>`, timed `location` change) where read-only tools could observe a
+  foreign page.
+- If the operator's initial URL redirects (http→https, apex→www), the
+  landing origin is added to the allowlist and logged instead of breaking
+  the run.
+- README redaction claim tightened: URL **paths** are not redacted (avoid
+  magic-link / reset-token paths); SECURITY.md states this explicitly.
+- More "no bugs" phrasings ("No issues.", "None to report", "No problems
+  detected") no longer false-positive the critical-bug gate.
+
+### Initial hardening
+
 Security-hardening release following an external adversarial code review.
 See `reviews/gptpro-2026-06-11.md` for the full review and SECURITY.md for
 the resulting threat model.

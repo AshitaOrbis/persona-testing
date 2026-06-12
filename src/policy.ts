@@ -37,7 +37,11 @@ export type NavigationCheck =
 
 export class NavigationPolicy {
   readonly initialUrl: string;
-  readonly allowedOrigins: ReadonlySet<string>;
+  private readonly origins: Set<string>;
+
+  get allowedOrigins(): ReadonlySet<string> {
+    return this.origins;
+  }
 
   /**
    * @param initialUrl  Operator-supplied target URL (trusted; may be localhost
@@ -60,7 +64,25 @@ export class NavigationPolicy {
       }
       origins.add(u.origin);
     }
-    this.allowedOrigins = origins;
+    this.origins = origins;
+  }
+
+  /**
+   * The operator-supplied URL may itself redirect (http→https, apex→www).
+   * That redirect chain carries the operator's trust, so the landing origin
+   * is added to the allowlist. Returns the added origin, or null if it was
+   * already allowed. Throws on non-http(s) landings.
+   */
+  allowInitialLanding(landedUrl: string): string | null {
+    const u = new URL(landedUrl);
+    if (!ALLOWED_SCHEMES.has(u.protocol)) {
+      throw new Error(
+        `Initial navigation landed on disallowed scheme "${u.protocol}" (${landedUrl})`,
+      );
+    }
+    if (this.origins.has(u.origin)) return null;
+    this.origins.add(u.origin);
+    return u.origin;
   }
 
   /** Validate an operator-supplied URL: must parse and be http/https. */

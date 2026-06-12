@@ -327,6 +327,11 @@ const negativeForms = [
   "**None**",
   "N/A",
   "Nothing critical",
+  "No issues.",
+  "No issues found",
+  "No problems detected",
+  "None to report",
+  "No blocking bugs",
 ];
 for (const form of negativeForms) {
   test(`treats "${form.replace(/\n/g, "\\n")}" as no critical bugs`, () => {

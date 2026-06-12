@@ -176,7 +176,7 @@ function detectCriticalBugs(markdown: string): boolean {
   if (section.length === 0) return false;
 
   const NEGATIVE_FORMS =
-    /^(none|n\/a|nothing( critical)?|none (observed|found|detected|noted|identified|encountered)|no critical bugs?( were| was)?( found| observed| detected| noted| identified| encountered)?)$/;
+    /^(none|n\/a|nothing( critical)?|none (observed|found|detected|noted|identified|encountered|to report)|no (critical |major |blocking )?(bugs?|issues?|problems?|defects?)( were| was)?( found| observed| detected| noted| identified| encountered)?)$/;
   if (NEGATIVE_FORMS.test(section)) return false;
 
   return section.length > 5;

@@ -107,7 +107,7 @@ export class AnthropicProvider implements AIProvider {
       apiKey: options.apiKey,
       timeout: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });
-    this.model = options.model || "claude-sonnet-4-5-20250514";
+    this.model = options.model || "claude-sonnet-4-5-20250929";
     this.maxIterations = clampIterations(options.maxIterations);
     this.options = options;
   }

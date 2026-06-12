@@ -225,8 +225,10 @@ The agent's navigation is **restricted to the target URL's origin**, enforced
 in code: `file:`, `data:`, `javascript:`, and cross-origin URLs are refused,
 and link-clicks or redirects that escape the origin are reverted. Each run is
 bounded by an iteration cap, a wall-clock deadline, and token budgets.
-Secret-bearing URLs are redacted from prompts and reports, and typed text is
-never echoed into the model transcript.
+Credentials, query strings, and fragments in URLs are redacted from prompts
+and reports (URL *paths* are preserved — avoid magic-link or reset-token
+paths like `/reset/<token>`), and typed text is never echoed into the model
+transcript.
 
 What code cannot eliminate: text on the tested page is input to the model, so
 a hostile page can still try to skew the *content* of the assessment. Do not

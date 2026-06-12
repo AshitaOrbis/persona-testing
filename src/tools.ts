@@ -234,6 +234,15 @@ export class PlaywrightBridge {
       this.navigationFailures++;
       throw err;
     }
+    // The operator's URL may legitimately redirect (http→https, apex→www).
+    // Trust the operator's redirect chain: widen the allowlist to the
+    // landing origin and say so.
+    const added = this.policy.allowInitialLanding(this.page.url());
+    if (added) {
+      console.warn(
+        `Note: target URL redirected to ${added}; added it to the allowed origins.`,
+      );
+    }
   }
 
   /**
@@ -244,7 +253,16 @@ export class PlaywrightBridge {
     this.totalCalls++;
     let result: string;
     try {
-      result = await this.dispatchInner(name, input);
+      // The page can leave the allowed origins WITHOUT a tool action — e.g.
+      // a <meta refresh> or a timed window.location redirect planted by the
+      // tested page. Re-check before every tool call so read-only tools
+      // (get_outline, screenshot, get_url, ...) never observe a foreign page.
+      const drift = await this.enforceOrigin("page (background redirect)");
+      if (drift) {
+        result = drift;
+      } else {
+        result = await this.dispatchInner(name, input);
+      }
     } catch (err) {
       this.errorCount++;
       if (name === "navigate") this.navigationFailures++;
@@ -437,7 +455,7 @@ export class PlaywrightBridge {
       }
     }
     return (
-      `Policy: the ${action} action navigated the page to ${offending}, which is ` +
+      `Policy: the page moved to ${offending} (via ${action}), which is ` +
       `outside the allowed origins. The browser was returned to the target ` +
       `application. Do not attempt to leave the target site.`
     );
