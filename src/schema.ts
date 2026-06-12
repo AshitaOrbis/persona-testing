@@ -53,9 +53,18 @@ export interface CriteriaVerdict {
   [criterionName: string]: Verdict;
 }
 
+/** Machine-readable execution health for a probe run. */
+export interface ToolStats {
+  total_calls: number;
+  errors: number;
+  policy_blocks: number;
+  navigation_failures: number;
+}
+
 export interface ProbeResult {
   persona: string;
   timestamp: string;
+  /** Redacted URL (userinfo/query/hash stripped) — safe for reports. */
   url: string;
   readiness_pct: number;
   critical_bugs: boolean;
@@ -64,6 +73,20 @@ export interface ProbeResult {
   screenshots: string[];
   report_markdown: string;
   report_path?: string;
+  /** Parser warnings, e.g. out-of-range readiness score. */
+  parse_errors?: string[];
+  /** Browser tool execution health (used by `check` to flag inconclusive runs). */
+  tool_stats?: ToolStats;
+  /** Run ID linking this report to a run manifest. */
+  run_id?: string;
+}
+
+/** Manifest written by `run`, consumed by `check` to avoid stale reports. */
+export interface RunManifest {
+  run_id: string;
+  created: string;
+  url: string;
+  reports: string[];
 }
 
 export interface ProbeConfig {
@@ -74,6 +97,16 @@ export interface ProbeConfig {
   report_dir?: string;
   api_key?: string;
   max_iterations?: number;
+  /** Overall run deadline per persona, in ms (default 900000 = 15 min). */
+  timeout_ms?: number;
+  /** Per-API-request timeout in ms (default 120000). */
+  request_timeout_ms?: number;
+  /** Cumulative input-token budget per persona run (default 1000000). */
+  max_input_tokens?: number;
+  /** Cumulative output-token budget per persona run (default 64000). */
+  max_output_tokens?: number;
+  /** Extra origins the agent may navigate to (same-origin is always allowed). */
+  allowed_origins?: string[];
 }
 
 /** Tool names that the AI can call for browser automation */

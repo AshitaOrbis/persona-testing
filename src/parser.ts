@@ -31,14 +31,25 @@ export function parseAssessment(
     items: [],
     screenshots: [],
     report_markdown: markdown,
+    parse_errors: [],
   };
 
   // --- Readiness Score ---
+  // Out-of-range scores are rejected (not clamped) so a prompt-injected
+  // "Readiness Score: 999%" cannot pass a CI gate.
   const readinessMatch = markdown.match(
     /###\s*Readiness\s*Score[:\s]*(\d+)\s*%/i,
   );
   if (readinessMatch) {
-    result.readiness_pct = parseInt(readinessMatch[1]);
+    const n = Number(readinessMatch[1]);
+    if (Number.isInteger(n) && n >= 0 && n <= 100) {
+      result.readiness_pct = n;
+    } else {
+      result.readiness_pct = 0;
+      result.parse_errors!.push(
+        `Invalid readiness score "${readinessMatch[1]}%" (must be 0-100); treated as 0`,
+      );
+    }
   }
 
   // --- Criteria Verdicts ---
@@ -151,8 +162,24 @@ function detectCriticalBugs(markdown: string): boolean {
   );
   if (!sectionMatch) return false;
 
-  const section = sectionMatch[1].trim().toLowerCase();
-  return section !== "none" && section !== "none." && section.length > 5;
+  // Normalize common "no bugs" phrasings: strip list markers, emphasis,
+  // surrounding whitespace, and trailing punctuation.
+  const section = sectionMatch[1]
+    .trim()
+    .toLowerCase()
+    .replace(/^[-*•\s]+/gm, "")
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!]+$/, "")
+    .trim();
+
+  if (section.length === 0) return false;
+
+  const NEGATIVE_FORMS =
+    /^(none|n\/a|nothing( critical)?|none (observed|found|detected|noted|identified|encountered)|no critical bugs?( were| was)?( found| observed| detected| noted| identified| encountered)?)$/;
+  if (NEGATIVE_FORMS.test(section)) return false;
+
+  return section.length > 5;
 }
 
 // --- Heuristic helpers for fallback parsing ---

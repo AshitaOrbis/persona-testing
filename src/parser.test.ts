@@ -294,6 +294,62 @@ test("partial parse returns what it can", () => {
   assert.equal(Object.keys(result.criteria).length, 0);
 });
 
+console.log("\nReadiness Score Bounds:");
+test("rejects out-of-range readiness score (999%) and records parse error", () => {
+  const md = "## Structured Assessment\n\n### Readiness Score: 999%\n";
+  const result = parseAssessment(md, "Test User", "https://app.example.com");
+  assert.equal(result.readiness_pct, 0);
+  assert.ok(result.parse_errors && result.parse_errors.length > 0);
+  assert.ok(result.parse_errors![0].includes("999"));
+});
+
+test("accepts boundary readiness scores 0 and 100", () => {
+  const zero = parseAssessment("### Readiness Score: 0%", "T", "https://x.example");
+  assert.equal(zero.readiness_pct, 0);
+  assert.equal(zero.parse_errors!.length, 0);
+  const hundred = parseAssessment("### Readiness Score: 100%", "T", "https://x.example");
+  assert.equal(hundred.readiness_pct, 100);
+  assert.equal(hundred.parse_errors!.length, 0);
+});
+
+console.log("\nCritical Bugs Negative Forms:");
+const negativeForms = [
+  "None",
+  "None.",
+  "none",
+  "No critical bugs found.",
+  "No critical bugs",
+  "No critical bugs were found.",
+  "None observed.",
+  "None encountered",
+  "- None",
+  "* None",
+  "**None**",
+  "N/A",
+  "Nothing critical",
+];
+for (const form of negativeForms) {
+  test(`treats "${form.replace(/\n/g, "\\n")}" as no critical bugs`, () => {
+    const md = `## Structured Assessment\n\n### Critical Bugs\n\n${form}\n\n### Summary\n\nFine.`;
+    const result = parseAssessment(md, "Test User", "https://app.example.com");
+    assert.equal(result.critical_bugs, false);
+  });
+}
+
+test("still detects real critical bug descriptions", () => {
+  const md =
+    "## Structured Assessment\n\n### Critical Bugs\n\nThe dashboard crashes on load with a blank screen.\n\n### Summary\n\nBroken.";
+  const result = parseAssessment(md, "Test User", "https://app.example.com");
+  assert.equal(result.critical_bugs, true);
+});
+
+test("detects bulleted real critical bug", () => {
+  const md =
+    "## Structured Assessment\n\n### Critical Bugs\n\n- Login form returns HTTP 500 on every submission\n\n### Summary\n\nBroken.";
+  const result = parseAssessment(md, "Test User", "https://app.example.com");
+  assert.equal(result.critical_bugs, true);
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------

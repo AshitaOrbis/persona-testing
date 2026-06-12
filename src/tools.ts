@@ -3,12 +3,25 @@
  *
  * Provides 11 browser tools the AI can call, mirroring the tool surface
  * used by Claude Code's water-director persona agents.
+ *
+ * Security properties enforced here (not in the prompt):
+ *   - Model-requested navigation is restricted to allowed origins (NavigationPolicy).
+ *   - Click/keyboard-induced cross-origin escapes are detected and reverted.
+ *   - Tool inputs are validated; timeouts are clamped.
+ *   - Tool results are size-capped before reaching the model.
+ *   - Typed text is never echoed back into the model transcript.
  */
 
 import type { Page } from "playwright";
-import type { ToolName } from "./schema.js";
+import type { ToolName, ToolStats } from "./schema.js";
+import { NavigationPolicy, redactUrl } from "./policy.js";
 import { mkdirSync } from "fs";
 import { join } from "path";
+
+/** Maximum characters of any single tool result sent to the model. */
+const MAX_TOOL_RESULT_CHARS = 20_000;
+/** Maximum selector-wait timeout the model may request. */
+const MAX_WAIT_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Tool schema definitions (sent to the AI model)
@@ -27,11 +40,16 @@ export interface ToolDefinition {
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "navigate",
-    description: "Navigate the browser to a URL.",
+    description:
+      "Navigate the browser to a URL on the target application's origin. " +
+      "Cross-origin, file:, data:, and javascript: URLs are blocked by policy.",
     input_schema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "The URL to navigate to." },
+        url: {
+          type: "string",
+          description: "The URL to navigate to (same-origin absolute URL or relative path).",
+        },
       },
       required: ["url"],
     },
@@ -106,8 +124,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         selector: { type: "string", description: "Selector to wait for." },
         timeout_ms: {
-          type: "string",
-          description: "Max wait time in milliseconds (default 15000).",
+          type: "integer",
+          description: "Max wait time in milliseconds (default 15000, max 30000).",
         },
       },
       required: ["selector"],
@@ -150,7 +168,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "get_url",
-    description: "Get the current page URL.",
+    description:
+      "Get the current page URL (query string and fragment are redacted).",
     input_schema: {
       type: "object",
       properties: {},
@@ -166,20 +185,55 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 export interface BridgeOptions {
   screenshotDir: string;
   personaSlug: string;
+  policy: NavigationPolicy;
+  runId: string;
 }
 
 export class PlaywrightBridge {
   private page: Page;
   private screenshotDir: string;
   private personaSlug: string;
+  private policy: NavigationPolicy;
+  private runId: string;
   private screenshotCounter = 0;
   readonly screenshots: string[] = [];
+
+  private totalCalls = 0;
+  private errorCount = 0;
+  private policyBlockCount = 0;
+  private navigationFailures = 0;
 
   constructor(page: Page, options: BridgeOptions) {
     this.page = page;
     this.screenshotDir = options.screenshotDir;
     this.personaSlug = options.personaSlug;
+    this.policy = options.policy;
+    this.runId = options.runId;
     mkdirSync(this.screenshotDir, { recursive: true });
+  }
+
+  get stats(): ToolStats {
+    return {
+      total_calls: this.totalCalls,
+      errors: this.errorCount,
+      policy_blocks: this.policyBlockCount,
+      navigation_failures: this.navigationFailures,
+    };
+  }
+
+  /**
+   * Programmatic initial navigation to the operator-supplied URL.
+   * Called by the harness before the model loop starts, so the full
+   * (possibly secret-bearing) URL never needs to appear in the prompt.
+   */
+  async initialNavigate(fullUrl: string): Promise<void> {
+    try {
+      await this.page.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await this.page.waitForTimeout(1000); // let SPA hydrate
+    } catch (err) {
+      this.navigationFailures++;
+      throw err;
+    }
   }
 
   /**
@@ -187,59 +241,98 @@ export class PlaywrightBridge {
    * Never throws — returns error strings so the AI can adapt.
    */
   async dispatch(name: ToolName, input: Record<string, unknown>): Promise<string> {
+    this.totalCalls++;
+    let result: string;
     try {
-      switch (name) {
-        case "navigate":
-          return await this.navigate(input.url as string);
-        case "click":
-          return await this.click(input.selector as string);
-        case "type":
-          return await this.typeText(input.selector as string, input.text as string);
-        case "hover":
-          return await this.hover(input.selector as string);
-        case "select_option":
-          return await this.selectOption(input.selector as string, input.value as string);
-        case "press_key":
-          return await this.pressKey(input.key as string);
-        case "wait_for_selector":
-          return await this.waitForSelector(
-            input.selector as string,
-            input.timeout_ms ? parseInt(input.timeout_ms as string) : undefined,
-          );
-        case "screenshot":
-          return await this.takeScreenshot(input.name as string);
-        case "get_outline":
-          return await this.getOutline();
-        case "scroll_to_bottom":
-          return await this.scrollToBottom();
-        case "get_url":
-          return this.page.url();
-        default:
-          return `Unknown tool: ${name}`;
-      }
+      result = await this.dispatchInner(name, input);
     } catch (err) {
+      this.errorCount++;
+      if (name === "navigate") this.navigationFailures++;
       const msg = err instanceof Error ? err.message : String(err);
-      return `Error (${name}): ${msg}`;
+      result = `Error (${name}): ${msg}`;
     }
+    return truncateResult(result);
+  }
+
+  private async dispatchInner(name: ToolName, input: Record<string, unknown>): Promise<string> {
+    switch (name) {
+      case "navigate":
+        return await this.navigate(this.requireString(input, "url", name));
+      case "click":
+        return await this.click(this.requireString(input, "selector", name));
+      case "type":
+        return await this.typeText(
+          this.requireString(input, "selector", name),
+          this.requireString(input, "text", name),
+        );
+      case "hover":
+        return await this.hover(this.requireString(input, "selector", name));
+      case "select_option":
+        return await this.selectOption(
+          this.requireString(input, "selector", name),
+          this.requireString(input, "value", name),
+        );
+      case "press_key":
+        return await this.pressKey(this.requireString(input, "key", name));
+      case "wait_for_selector":
+        return await this.waitForSelector(
+          this.requireString(input, "selector", name),
+          clampTimeout(input.timeout_ms),
+        );
+      case "screenshot":
+        return await this.takeScreenshot(this.requireString(input, "name", name));
+      case "get_outline":
+        return await this.getOutline();
+      case "scroll_to_bottom":
+        return await this.scrollToBottom();
+      case "get_url":
+        return redactUrl(this.page.url());
+      default:
+        this.errorCount++;
+        return `Unknown tool: ${name}`;
+    }
+  }
+
+  /** Validate a required string input; throws a structured error otherwise. */
+  private requireString(input: Record<string, unknown>, key: string, tool: string): string {
+    const v = input[key];
+    if (typeof v !== "string" || v.length === 0) {
+      throw new Error(
+        `invalid input for ${tool}: "${key}" is required and must be a non-empty string`,
+      );
+    }
+    return v;
   }
 
   // -- Individual tool implementations --
 
   private async navigate(url: string): Promise<string> {
-    await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    const check = this.policy.checkModelNavigation(url, this.page.url());
+    if (!check.ok) {
+      this.policyBlockCount++;
+      return `Navigation blocked by policy: ${check.reason}`;
+    }
+    await this.page.goto(check.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await this.page.waitForTimeout(1000); // let SPA hydrate
-    return `Navigated to ${this.page.url()}`;
+    // A same-origin URL may redirect cross-origin — detect and revert.
+    const escaped = await this.enforceOrigin("navigate (redirect)");
+    if (escaped) return escaped;
+    return `Navigated to ${redactUrl(this.page.url())}`;
   }
 
   private async click(selector: string): Promise<string> {
     await this.page.click(selector, { timeout: 10_000 });
     await this.page.waitForTimeout(500);
+    const escaped = await this.enforceOrigin("click");
+    if (escaped) return escaped;
     return `Clicked: ${selector}`;
   }
 
   private async typeText(selector: string, text: string): Promise<string> {
     await this.page.fill(selector, text, { timeout: 10_000 });
-    return `Typed "${text}" into ${selector}`;
+    // Never echo the typed value back into the model transcript — it may be
+    // a credential or PII that would otherwise end up in reports.
+    return `Typed ${text.length} characters into ${selector}`;
   }
 
   private async hover(selector: string): Promise<string> {
@@ -249,11 +342,15 @@ export class PlaywrightBridge {
 
   private async selectOption(selector: string, value: string): Promise<string> {
     await this.page.selectOption(selector, value, { timeout: 10_000 });
+    const escaped = await this.enforceOrigin("select_option");
+    if (escaped) return escaped;
     return `Selected "${value}" in ${selector}`;
   }
 
   private async pressKey(key: string): Promise<string> {
     await this.page.keyboard.press(key);
+    const escaped = await this.enforceOrigin("press_key");
+    if (escaped) return escaped;
     return `Pressed: ${key}`;
   }
 
@@ -265,8 +362,8 @@ export class PlaywrightBridge {
   private async takeScreenshot(name: string): Promise<string> {
     this.screenshotCounter++;
     const counter = String(this.screenshotCounter).padStart(3, "0");
-    const safeName = name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
-    const filename = `${this.personaSlug}-${counter}-${safeName}.png`;
+    const safeName = name.replace(/[^a-z0-9_-]/gi, "-").toLowerCase().slice(0, 60);
+    const filename = `${this.personaSlug}-${this.runId}-${counter}-${safeName}.png`;
     const filepath = join(this.screenshotDir, filename);
 
     await this.page.screenshot({ path: filepath, fullPage: false });
@@ -309,4 +406,55 @@ export class PlaywrightBridge {
     await this.page.waitForTimeout(500);
     return "Scrolled to bottom";
   }
+
+  /**
+   * If an action caused the page to leave the allowed origins (link click,
+   * form submit, redirect), navigate back and report the policy violation.
+   * Returns a message string when an escape was reverted, null otherwise.
+   */
+  private async enforceOrigin(action: string): Promise<string | null> {
+    const current = this.page.url();
+    if (current === "about:blank" || this.policy.isAllowedUrl(current)) return null;
+
+    this.policyBlockCount++;
+    const offending = redactUrl(current);
+    try {
+      await this.page.goBack({ waitUntil: "domcontentloaded", timeout: 15_000 });
+      if (!this.policy.isAllowedUrl(this.page.url())) {
+        await this.page.goto(this.policy.initialUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+      }
+    } catch {
+      try {
+        await this.page.goto(this.policy.initialUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+      } catch {
+        this.navigationFailures++;
+      }
+    }
+    return (
+      `Policy: the ${action} action navigated the page to ${offending}, which is ` +
+      `outside the allowed origins. The browser was returned to the target ` +
+      `application. Do not attempt to leave the target site.`
+    );
+  }
+}
+
+function clampTimeout(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const n = typeof raw === "string" ? Number(raw) : raw;
+  if (typeof n !== "number" || !Number.isFinite(n)) return undefined;
+  return Math.min(Math.max(Math.floor(n), 0), MAX_WAIT_TIMEOUT_MS);
+}
+
+function truncateResult(result: string): string {
+  if (result.length <= MAX_TOOL_RESULT_CHARS) return result;
+  return (
+    result.slice(0, MAX_TOOL_RESULT_CHARS) +
+    `\n\n[tool result truncated from ${result.length} to ${MAX_TOOL_RESULT_CHARS} characters]`
+  );
 }

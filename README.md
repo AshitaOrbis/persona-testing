@@ -28,8 +28,9 @@ The persona doesn't know your codebase. It only knows its job title, goals, and 
 ## Quick Start
 
 ```bash
-# 1. Install
+# 1. Install (the CLI plus the Playwright Chromium binaries)
 npm install -g persona-testing
+npx playwright install chromium
 
 # 2. Create a persona
 persona-testing init --name "New User" --output personas/new-user.yml
@@ -37,8 +38,8 @@ persona-testing init --name "New User" --output personas/new-user.yml
 # 3. Run a probe
 persona-testing run --persona personas/new-user.yml --url https://your-app.com
 
-# 4. Read the report
-cat reports/new-user-2026-02-16.md
+# 4. Read the report (filenames embed a unique run ID)
+cat reports/new-user-*.md
 ```
 
 ## Persona Definition
@@ -106,7 +107,7 @@ critical_bug_protocol:
 
 Each probe produces:
 
-### Markdown Report (`reports/{persona}-{date}.md`)
+### Markdown Report (`reports/{persona}-{run-id}.md`)
 
 Human-readable narrative from the persona's perspective:
 - Executive summary
@@ -115,7 +116,7 @@ Human-readable narrative from the persona's perspective:
 - Confidence assessment
 - Recommendations
 
-### Structured JSON (`reports/{persona}-{date}.json`)
+### Structured JSON (`reports/{persona}-{run-id}.json`)
 
 Machine-parseable results for CI/CD integration:
 
@@ -181,7 +182,6 @@ Use the structured JSON output to gate deployments:
       --personas personas/ \
       --url ${{ env.STAGING_URL }} \
       --output-dir reports/
-      --json
 
 - name: Check readiness
   run: |
@@ -189,13 +189,23 @@ Use the structured JSON output to gate deployments:
     persona-testing check --reports reports/ --min-readiness 60
 ```
 
+`run` writes a `run-manifest.json` alongside the reports; `check` reads the
+manifest so reports from earlier runs can never satisfy (or break) the gate.
+`check` exits non-zero on low readiness, critical bugs, or an inconclusive
+run (one where most browser tool calls failed). Unknown commands and flags
+are hard errors (exit code 2), so a typo can't silently skip the gate.
+
+**CI security note:** persona YAML is injected into the model prompt. Load
+personas from a trusted branch or pinned artifact — never from untrusted
+pull-request content. See [SECURITY.md](SECURITY.md).
+
 ## Examples
 
 See `examples/` for ready-to-use persona definitions:
 
 - `examples/new-user.yml` - First-time user with no training
 - `examples/power-user.yml` - Experienced user evaluating advanced features
-- `examples/accessibility.yml` - User testing with screen reader and keyboard navigation
+- `examples/accessibility.yml` - Accessibility-minded reviewer (heuristic only — see the caveat in the file; this is **not** real screen-reader or WCAG-contrast testing)
 
 ## How Probes Work
 
@@ -207,12 +217,32 @@ Under the hood, each probe:
 4. It evaluates the app from the persona's perspective, taking screenshots and notes
 5. Produces a structured report
 
-The persona definition constrains the AI's behavior: it doesn't know implementation details, only what a real user in that role would know and expect.
+The persona definition *guides* the AI's behavior: it doesn't know implementation details, only what a real user in that role would know and expect. Persona and page text are prompts, not a security boundary — the enforced boundaries (origin-restricted navigation, budgets, input validation) live in code. See [Security](#security).
+
+## Security
+
+The agent's navigation is **restricted to the target URL's origin**, enforced
+in code: `file:`, `data:`, `javascript:`, and cross-origin URLs are refused,
+and link-clicks or redirects that escape the origin are reverted. Each run is
+bounded by an iteration cap, a wall-clock deadline, and token budgets.
+Secret-bearing URLs are redacted from prompts and reports, and typed text is
+never echoed into the model transcript.
+
+What code cannot eliminate: text on the tested page is input to the model, so
+a hostile page can still try to skew the *content* of the assessment. Do not
+run this against sites you don't trust, and treat reports as advisory — full
+threat model in [SECURITY.md](SECURITY.md).
+
+```bash
+# Allow an additional origin (e.g. a separate auth domain) when needed:
+persona-testing run --persona p.yml --url https://app.example.com \
+  --allow-origin https://auth.example.com
+```
 
 ## Requirements
 
 - Node.js 20+
-- A Playwright-compatible browser
+- Playwright Chromium binaries (`npx playwright install chromium`)
 - An AI model API key (Claude, OpenAI, etc.)
 
 ## Configuration
@@ -229,8 +259,20 @@ model: claude-sonnet-4-5-20250929
 browser: chromium
 screenshot_dir: ./screenshots
 report_dir: ./reports
+# Optional guardrail tuning (defaults shown)
+max_iterations: 50          # model loop cap, hard max 100
+timeout_ms: 900000          # wall-clock deadline per persona run
+request_timeout_ms: 120000  # per-API-request timeout
+max_input_tokens: 1000000   # cumulative input-token budget per run
+max_output_tokens: 64000    # cumulative output-token budget per run
+# allowed_origins:          # extra origins the agent may navigate to
+#   - https://auth.example.com
 EOF
 ```
+
+Run flags: `--persona` (repeatable), `--personas <dir>`, `--url`,
+`--output-dir`, `--screenshot-dir`, `--max-iterations`, `--timeout-ms`,
+`--allow-origin` (repeatable). Run `persona-testing --help` for details.
 
 ## Acknowledgements
 
