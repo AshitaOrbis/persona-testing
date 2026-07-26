@@ -10,9 +10,11 @@ Its findings, fixed in this release:
 
 - **Default Anthropic model ID was invalid** (`claude-sonnet-4-5-20250514`
   spliced the Sonnet 4.5 name onto the Sonnet 4 date). Default runs would
-  404 on the first API call. Now `claude-sonnet-4-6`, as an undated alias
-  rather than another pinned snapshot, so the default tracks its model line
-  instead of rotting the same way (2026-07-26).
+  404 on the first API call. Now `claude-sonnet-4-6`, verified against
+  Anthropic's published model list on 2026-07-26. Note this ID is a pinned
+  snapshot despite having no date in it — from the 4.6 generation onward,
+  dateless Claude IDs are snapshots rather than evergreen pointers — so the
+  default still wants a look when model lines turn over (2026-07-26).
 - **Dependency advisories cleared**, production count 2 → 0 (2026-07-26):
   `form-data` CRLF injection (GHSA-hmw2-7cc7-3qxx, high, transitive) and
   `yaml` stack overflow on deeply nested collections (GHSA-48c2-rrv3-qjmp,

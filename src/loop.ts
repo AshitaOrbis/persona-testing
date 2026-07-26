@@ -107,9 +107,11 @@ export class AnthropicProvider implements AIProvider {
       apiKey: options.apiKey,
       timeout: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });
-    // Undated alias, deliberately. A pinned snapshot ID is what made the pre-0.3.0
-    // default 404; the alias tracks the current snapshot of that model line, so this
-    // default cannot silently rot the same way again.
+    // Verified against Anthropic's published model list (2026-07-26): this is a
+    // valid current API model ID. Note it is NOT evergreen — from the 4.6
+    // generation on, dateless IDs are still pinned snapshots, not moving
+    // pointers. So this default does need reviewing when model lines turn over;
+    // it is correct today, not self-maintaining.
     this.model = options.model || "claude-sonnet-4-6";
     this.maxIterations = clampIterations(options.maxIterations);
     this.options = options;
