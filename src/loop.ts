@@ -107,7 +107,10 @@ export class AnthropicProvider implements AIProvider {
       apiKey: options.apiKey,
       timeout: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });
-    this.model = options.model || "claude-sonnet-4-5-20250929";
+    // Undated alias, deliberately. A pinned snapshot ID is what made the pre-0.3.0
+    // default 404; the alias tracks the current snapshot of that model line, so this
+    // default cannot silently rot the same way again.
+    this.model = options.model || "claude-sonnet-4-6";
     this.maxIterations = clampIterations(options.maxIterations);
     this.options = options;
   }

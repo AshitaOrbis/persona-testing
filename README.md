@@ -257,7 +257,7 @@ export PERSONA_TESTING_API_KEY=your-key
 # Or use a config file
 cat > .persona-testing.yml << EOF
 provider: anthropic
-model: claude-sonnet-4-5-20250929
+model: claude-sonnet-4-6
 browser: chromium
 screenshot_dir: ./screenshots
 report_dir: ./reports
