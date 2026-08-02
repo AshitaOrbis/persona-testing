@@ -2,7 +2,7 @@
  * System prompt builder — constructs the AI system prompt from a PersonaDefinition.
  *
  * The prompt tells the AI who it is, what it's evaluating, and what structured
- * output to produce. Mirrors the pattern from SourceCashflow's water-director agents.
+ * output to produce. Mirrors the pattern used by the finance app's director agents.
  *
  * Security note: prompt text is guidance, NOT a security boundary. The
  * enforced boundaries (origin-restricted navigation, tool input validation,
