@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.4.0 — 2026-10-18
+
+The report checker is rebuilt on a real Markdown parser and is stricter: some
+reports that 0.3.0 accepted are now refused. As a minor bump on a 0.x line,
+0.4.0 is outside `^0.3.0`, so projects depending on that range keep 0.3.x
+until they upgrade explicitly.
+
+### Report checker
+
+- Reports are read from the tokens of markdown-it 15.0.2, a pinned CommonMark
+  parser and a new runtime dependency, instead of hand-written line scanners.
+- `check` refuses forged and out-of-range reports: readiness must be an
+  integer from 0 to 100, `critical_bugs` a boolean and the terminal state
+  PASSED, and the stored fields must match a fresh parse of the report.
+- A run passes only with at least one successful browser observation, one
+  scenario-relevant interaction, no navigation failures and a majority of
+  healthy calls. Malformed tool-call JSON from a provider is counted rather
+  than dropped.
+- The run manifest is mandatory and bound to the run id, the invocation, the
+  timestamps and the expected personas; an unlisted or missing report fails.
+- A report has exactly one Structured Assessment, judged by what a reader
+  sees: a heading in ATX or setext form, decorated with emphasis, code or
+  links, or written with character references, look-alike letters or symbols
+  (a table generated from Unicode's confusables data), fullwidth forms or
+  invisible characters still counts. Only the canonical
+  `## Structured Assessment` is read.
+- Inside the assessment, a level-three heading other than the five format
+  sections (Readiness Score, Criteria Verdicts, Actionable Items, Critical
+  Bugs, Summary) is fatal, and so is a section name used as a label anywhere
+  but its own heading. Prose that merely begins with a section name is not a
+  label.
+- Only a recognised negative declaration ("None", "No critical bugs found",
+  ...) means no critical bugs; an empty section, or short content such as
+  "Crash", no longer does.
+- Outside code, raw HTML, unsupported named character references, Unicode
+  line and paragraph separators and bidirectional controls are fatal. CR and
+  CRLF line endings are read as LF.
+- A report whose emphasis nests deeper than 100 levels is refused.
+- An action item keeps its explicit classification and priority when its
+  description wraps onto a second line.
+
+### Runs
+
+- Output cut off at the provider's output cap is recorded as TRUNCATED
+  (`output_truncated`), never COMPLETED, and a cut-off tool call is not run.
+- Deadline and token budgets are checked before and after every model
+  request and tool call; exhausting one ends the run as BUDGET_EXHAUSTED with
+  no further provider call.
+
+### Packaging and documentation
+
+- The npm publish job installs nothing: it publishes the tarball built by the
+  unprivileged build job, using the npm bundled with Node 24.14.0, whose
+  version it asserts first.
+- The plaintext API-key config files the loader reads are gitignored.
+- README examples include the prepare step and `--invocation`; SECURITY.md
+  describes the redirect policy the code enforces.
+
 ## 0.3.0 — 2026-06-11
 
 ### Follow-up review fixes
