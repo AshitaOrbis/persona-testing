@@ -42,6 +42,13 @@ export interface PersonaDefinition {
 
 export type Verdict = "GOOD" | "FAIR" | "POOR" | "NOT_TESTED";
 export type Classification = "fixable" | "tradeoff" | "false_positive";
+export type ExecutionStatus = "COMPLETED" | "BUDGET_EXHAUSTED" | "TRUNCATED";
+export type StopReason =
+  | "completed"
+  | "max_iterations"
+  | "deadline"
+  | "token_budget"
+  | "output_truncated";
 
 export interface ActionableItem {
   description: string;
@@ -79,6 +86,10 @@ export interface ProbeResult {
   tool_stats?: ToolStats;
   /** Run ID linking this report to a run manifest. */
   run_id?: string;
+  /** Provider-loop completion health; non-completed states are never gate-eligible. */
+  execution_status?: ExecutionStatus;
+  /** Exact completion or exhaustion cause from the provider loop. */
+  stop_reason?: StopReason;
 }
 
 /** Manifest written by `run`, consumed by `check` to avoid stale reports. */
@@ -92,7 +103,6 @@ export interface RunManifest {
 export interface ProbeConfig {
   provider: "anthropic" | "openai";
   model?: string;
-  browser?: "chromium" | "firefox" | "webkit";
   screenshot_dir?: string;
   report_dir?: string;
   api_key?: string;
@@ -108,6 +118,34 @@ export interface ProbeConfig {
   /** Extra origins the agent may navigate to (same-origin is always allowed). */
   allowed_origins?: string[];
 }
+
+export type ConfigFieldDefinition =
+  | { kind: "enum"; values: readonly string[]; expected: string }
+  | { kind: "non_empty_string"; expected: string }
+  | { kind: "positive_integer"; expected: string }
+  | { kind: "non_empty_string_array"; expected: string };
+
+/** Runtime config shape used by validation and exhaustive schema-derived tests. */
+export const CONFIG_FIELD_SCHEMA = {
+  provider: {
+    kind: "enum",
+    values: ["anthropic", "openai"],
+    expected: '"anthropic" or "openai"',
+  },
+  model: { kind: "non_empty_string", expected: "a non-empty string" },
+  api_key: { kind: "non_empty_string", expected: "a non-empty string" },
+  report_dir: { kind: "non_empty_string", expected: "a non-empty string" },
+  screenshot_dir: { kind: "non_empty_string", expected: "a non-empty string" },
+  max_iterations: { kind: "positive_integer", expected: "a positive integer" },
+  timeout_ms: { kind: "positive_integer", expected: "a positive integer" },
+  request_timeout_ms: { kind: "positive_integer", expected: "a positive integer" },
+  max_input_tokens: { kind: "positive_integer", expected: "a positive integer" },
+  max_output_tokens: { kind: "positive_integer", expected: "a positive integer" },
+  allowed_origins: {
+    kind: "non_empty_string_array",
+    expected: "a list of non-empty strings",
+  },
+} as const satisfies Record<keyof ProbeConfig, ConfigFieldDefinition>;
 
 /** Tool names that the AI can call for browser automation */
 export type ToolName =

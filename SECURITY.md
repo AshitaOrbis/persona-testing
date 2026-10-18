@@ -12,15 +12,15 @@ remains inherent to the design.
 | Control | Where | What it does |
 |---------|-------|--------------|
 | Origin-restricted navigation | `src/policy.ts`, `src/tools.ts` | Model-requested navigation is only allowed to the target URL's origin (plus origins explicitly allowlisted via `--allow-origin` / `allowed_origins`). `file:`, `data:`, `javascript:`, `ftp:`, and all cross-origin URLs are refused. |
-| Cross-origin escape recovery | `src/tools.ts` | The page origin is re-checked before **every** tool call (covering clicks, key presses, redirects, and page-initiated escapes like `<meta refresh>` or timed `location` changes). If the page left the allowed origins, the bridge navigates back, reports the violation to the model, and counts it in run stats — read-only tools never observe a foreign page. If the operator's initial URL itself redirects (http→https, apex→www), the landing origin is added to the allowlist and logged. |
+| Cross-origin escape recovery | `src/tools.ts` | The page origin is re-checked before **every** tool call (covering clicks, key presses, redirects, and page-initiated escapes like `<meta refresh>` or timed `location` changes). If the page left the allowed origins, the bridge navigates back, reports the violation to the model, and counts it in run stats — read-only tools never observe a foreign page. Redirects never widen the allowlist: the initial navigation may land only on the target's own origin, an origin given with `--allow-origin` / `allowed_origins`, or — for a public `http://` target on the default port — the same host over `https://`. Any other landing (an apex→www redirect, for example) fails the run as a navigation failure; allow that origin explicitly if it is intended. |
 | Private-origin allowlist refusal | `src/policy.ts` | `--allow-origin` refuses localhost/loopback/RFC1918/link-local/metadata addresses (the target URL itself may be localhost for local testing). |
 | URL redaction | `src/policy.ts` | Credentials, query strings, and fragments are stripped from every URL that enters the model prompt, tool results, reports, or logs. The full URL is used only for the programmatic initial navigation. **URL paths are NOT redacted** — do not point the tool at path-embedded secrets (magic links, `/reset/<token>` URLs). |
 | No credential echo | `src/tools.ts` | The `type` tool reports only the number of characters typed, never the text, so passwords/API keys cannot leak into the transcript or reports. |
 | Tool input validation | `src/tools.ts` | Required string inputs are checked; wait timeouts are clamped to 30 s. |
 | Tool result size cap | `src/tools.ts` | Every tool result is truncated to 20,000 characters before reaching the model (defeats accessibility-tree token bombs). |
-| Run budgets | `src/loop.ts` | Iteration cap (hard max 100), wall-clock deadline (default 15 min/persona), cumulative input/output token budgets, and per-request API timeouts. |
-| Runtime schema validation | `src/validate.ts` | Persona and config YAML are validated before any browser or model call. |
-| Bounded CI gates | `src/parser.ts`, `src/index.ts` | Readiness scores outside 0–100 are rejected (a page that prompt-injects "Readiness Score: 999%" cannot pass a gate); `--min-readiness` must be an integer 0–100; unknown commands/flags are hard errors. |
+| Run budgets | `src/loop.ts` | Before every model request, verifies the remaining AI-loop deadline and conservative input/output allowance, caps `max_tokens`, and aborts at `min(request_timeout, remaining_deadline)`. Deadline, token, or iteration exhaustion makes the run terminal and issues no wrap-up request. The deadline begins immediately before the first provider request; browser launch/initial navigation are outside this particular timer. |
+| Runtime schema validation | `src/validate.ts` | Persona and config YAML reject unknown keys, wrong types, empty required nested strings, and unsupported browser selection before any model request. Gate-capable personas require substantive instructions, a scenario, and an evaluation criterion. |
+| Bounded CI gates | `src/parser.ts`, `src/index.ts` | Readiness scores outside 0–100 are rejected; only a `PASSED` terminal state can satisfy `check`. `BUDGET_EXHAUSTED`, `INCOMPLETE`, policy-blocked, and navigation-failed runs fail regardless of model score. `--min-readiness` must be an integer 0–100; unknown commands/flags are hard errors. |
 | Run manifests | `src/reporter.ts` | `check` consumes the manifest written by the most recent `run`, so stale reports cannot satisfy a CI gate. |
 | Tool-health gating | `src/index.ts` | A run where most tool calls failed is reported INCONCLUSIVE by `check` and fails the gate, regardless of the model's prose. |
 
@@ -61,8 +61,15 @@ not the agent's.
 
 ## Secrets
 
-- API keys are read from environment variables or the local config file and
-  are never written to reports or sent anywhere except the chosen AI provider.
+- Prefer `PERSONA_TESTING_API_KEY` (or the provider-specific environment
+  variable). It takes precedence over a file value. The active local config
+  files, `.persona-testing.yml` and `.persona-testing.yaml`, can technically
+  contain `api_key`. This repository ignores both active names plus
+  dotted/undotted equivalents and `.local` variants. npm consumers must add
+  the same protections to their own repositories. Never commit
+  credential-bearing config.
+- API keys are never written to reports or sent anywhere except the chosen AI
+  provider.
 - URLs containing credentials/tokens (`https://user:pass@…`, `?token=…`) are
   redacted everywhere except the actual browser navigation.
 - Anything visible **on pages** the agent visits (including secrets the app
@@ -76,8 +83,9 @@ not the agent's.
 - Pin the personas directory to a trusted ref; do not run persona files from
   untrusted pull requests.
 - The npm publish workflow separates an unprivileged build job from the
-  OIDC-privileged publish job, which only publishes a prebuilt tarball and
-  never runs dependency lifecycle scripts.
+  OIDC-privileged publish job. The privileged job uses an exact Node release
+  with its bundled npm, verifies both versions locally, and then publishes the
+  prebuilt tarball; it does not install registry tooling or dependencies.
 
 ## Reporting a vulnerability
 

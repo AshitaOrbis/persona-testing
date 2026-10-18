@@ -102,6 +102,40 @@ test("extra origin with private host is refused at construction", () => {
   assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://10.0.0.5"]));
 });
 
+test("IPv4-mapped loopback IPv6 extra origin is refused", () => {
+  assert.throws(() =>
+    new NavigationPolicy("https://app.example.com", ["http://[::ffff:127.0.0.1]"]),
+  );
+});
+
+test("IPv4-mapped metadata IPv6 extra origin is refused", () => {
+  assert.throws(() =>
+    new NavigationPolicy("https://app.example.com", ["http://[::ffff:169.254.169.254]"]),
+  );
+});
+
+test("IPv6 unspecified and loopback extra origins are refused", () => {
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[::]"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[::1]"]));
+});
+
+test("complete IPv6 link-local range is refused", () => {
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[fe80::1]"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[fe90::1]"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[febf::1]"]));
+});
+
+test("IPv6 unique-local extra origin is refused", () => {
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[fc00::1]"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://[fdff::1]"]));
+});
+
+test("IPv4 private, loopback, and link-local literals are refused", () => {
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://127.0.0.1"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://10.0.0.1"]));
+  assert.throws(() => new NavigationPolicy("https://app.example.com", ["http://169.254.169.254"]));
+});
+
 test("non-http extra origin is refused at construction", () => {
   assert.throws(() => new NavigationPolicy("https://app.example.com", ["file:///tmp"]));
 });
@@ -117,6 +151,21 @@ test("localhost target still blocks other local ports", () => {
   const p = new NavigationPolicy("http://localhost:3000");
   const r = p.checkModelNavigation("http://localhost:9200/_cat/indices", "http://localhost:3000/");
   assert.equal(r.ok, false);
+});
+
+console.log("\nInitial redirect admission:");
+test("same-host default-port HTTP-to-HTTPS transition is canonical", () => {
+  const p = new NavigationPolicy("http://app.example.com/start");
+  assert.equal(p.isAllowedUrl("https://app.example.com/landing"), true);
+  assert.equal(p.allowInitialLanding("https://app.example.com/landing"), null);
+});
+
+test("initial landing cannot authorize a foreign or private origin", () => {
+  const p = new NavigationPolicy("https://app.example.com/start");
+  assert.throws(() => p.allowInitialLanding("https://attacker.example/landing"));
+  assert.throws(() => p.allowInitialLanding("http://10.0.0.1/admin"));
+  assert.equal(p.isAllowedUrl("https://attacker.example/landing"), false);
+  assert.equal(p.isAllowedUrl("http://10.0.0.1/admin"), false);
 });
 
 console.log("\nOperator URL validation:");

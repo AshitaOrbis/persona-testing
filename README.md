@@ -35,12 +35,20 @@ npx playwright install chromium
 # 2. Create a persona
 persona-testing init --name "New User" --output personas/new-user.yml
 
-# 3. Run a probe
-persona-testing run --persona personas/new-user.yml --url https://your-app.com
+# 3. Create a fresh invocation file for this run, outside the reports directory
+persona-testing prepare --output .persona-invocation.json
 
-# 4. Read the report (filenames embed a unique run ID)
+# 4. Run a probe into a fresh reports directory
+persona-testing run --invocation .persona-invocation.json \
+  --persona personas/new-user.yml --url https://your-app.com --output-dir reports/
+
+# 5. Read the report (filenames embed a unique run ID)
 cat reports/new-user-*.md
 ```
+
+Every `run` and `check` needs `--invocation <file>` from `prepare`. `prepare`
+refuses to overwrite an existing file, and an invocation expires six hours after
+it was created, so make a new one (and a new reports directory) for each run.
 
 ## Persona Definition
 
@@ -103,6 +111,21 @@ critical_bug_protocol:
   continue_on: minor_ui_issues, slow_loading
 ```
 
+### Gate-capable and exploratory personas
+
+The `run`/`check` CLI path is gate-capable and therefore validates personas
+strictly. A gate-capable persona needs at least 20 characters of substantive
+`context`/`goals` instructions, one scenario with non-empty `name`,
+`description`, and `success` fields, and one evaluation criterion with a
+non-empty `name`, valid `weight`, and non-empty `question`. Unknown keys are
+rejected with a nearest-key suggestion; a name-only persona cannot produce CI
+gate evidence.
+
+The runtime validator also supports an explicit `exploratory` mode for non-gating
+integrations that intentionally accept a name-only persona. Exploratory output
+must remain advisory and must not be submitted to `persona-testing check`; the
+CLI intentionally defaults to gate-capable validation.
+
 ## Report Output
 
 Each probe produces:
@@ -125,6 +148,7 @@ Machine-parseable results for CI/CD integration:
   "persona": "sarah-martinez",
   "timestamp": "2026-02-16T10:30:00Z",
   "url": "https://your-app.com",
+  "terminal_state": "PASSED",
   "readiness_pct": 65,
   "critical_bugs": false,
   "criteria": {
@@ -160,14 +184,19 @@ Run multiple personas to test different user perspectives:
 
 ```bash
 # Run all personas in a directory
-persona-testing run --personas personas/ --url https://your-app.com
+persona-testing prepare --output .persona-invocation.json
+persona-testing run --invocation .persona-invocation.json \
+  --personas personas/ --url https://your-app.com --output-dir reports/
 
-# Run specific personas
+# Run specific personas (a new invocation file and reports directory per run)
+persona-testing prepare --output .persona-invocation-2.json
 persona-testing run \
+  --invocation .persona-invocation-2.json \
   --persona personas/new-user.yml \
   --persona personas/power-user.yml \
   --persona personas/admin.yml \
-  --url https://your-app.com
+  --url https://your-app.com \
+  --output-dir reports-2/
 ```
 
 ## CI/CD Integration
@@ -175,10 +204,16 @@ persona-testing run \
 Use the structured JSON output to gate deployments:
 
 ```yaml
-# GitHub Actions example
+# GitHub Actions example (a fresh job workspace: no earlier invocation file or reports)
+- name: Prepare the gate invocation
+  run: |
+    # Outside the reports directory; check refuses one stored inside it
+    persona-testing prepare --output "$RUNNER_TEMP/persona-invocation.json"
+
 - name: Run persona tests
   run: |
     persona-testing run \
+      --invocation "$RUNNER_TEMP/persona-invocation.json" \
       --personas personas/ \
       --url ${{ env.STAGING_URL }} \
       --output-dir reports/
@@ -186,14 +221,23 @@ Use the structured JSON output to gate deployments:
 - name: Check readiness
   run: |
     # Fail if any persona scores below 60%
-    persona-testing check --reports reports/ --min-readiness 60
+    persona-testing check \
+      --invocation "$RUNNER_TEMP/persona-invocation.json" \
+      --reports reports/ --min-readiness 60
 ```
 
-`run` writes a `run-manifest.json` alongside the reports; `check` reads the
-manifest so reports from earlier runs can never satisfy (or break) the gate.
-`check` exits non-zero on low readiness, critical bugs, or an inconclusive
-run (one where most browser tool calls failed). Unknown commands and flags
-are hard errors (exit code 2), so a typo can't silently skip the gate.
+`run` writes a `run-manifest.json` alongside the reports, bound to the
+invocation file; `check` verifies the manifest, the reports and their signed
+tool evidence against that same file, so reports from an earlier run can never
+satisfy the gate. They can break it: any report or evidence file in the
+directory that the manifest does not name fails `check`, so give every
+invocation its own fresh reports directory.
+`check` exits non-zero on low readiness, critical bugs, or any terminal state
+other than `PASSED`. Deadline/token exhaustion is `BUDGET_EXHAUSTED`;
+iteration-limited or otherwise incomplete evidence is `INCOMPLETE`. Neither
+can be converted into a pass by model prose or readiness score. Unknown
+commands and flags are hard errors (exit code 2), so a typo can't silently
+skip the gate.
 
 **CI security note:** persona YAML is injected into the model prompt. Load
 personas from a trusted branch or pinned artifact — never from untrusted
@@ -228,7 +272,10 @@ bounded by an iteration cap, a wall-clock deadline, and token budgets.
 Credentials, query strings, and fragments in URLs are redacted from prompts
 and reports (URL *paths* are preserved — avoid magic-link or reset-token
 paths like `/reset/<token>`), and typed text is never echoed into the model
-transcript.
+transcript. Before every model request, the provider loop verifies that the
+remaining deadline and token allowance can cover it, caps output tokens to
+the remaining allowance, and aborts the request at the remaining deadline.
+No post-limit wrap-up request is made.
 
 What code cannot eliminate: text on the tested page is input to the model, so
 a hostile page can still try to skew the *content* of the assessment. Do not
@@ -237,8 +284,8 @@ threat model in [SECURITY.md](SECURITY.md).
 
 ```bash
 # Allow an additional origin (e.g. a separate auth domain) when needed:
-persona-testing run --persona p.yml --url https://app.example.com \
-  --allow-origin https://auth.example.com
+persona-testing run --invocation .persona-invocation.json --persona p.yml \
+  --url https://app.example.com --allow-origin https://auth.example.com
 ```
 
 ## Requirements
@@ -254,16 +301,15 @@ persona-testing run --persona p.yml --url https://app.example.com \
 export PERSONA_TESTING_PROVIDER=anthropic  # or openai
 export PERSONA_TESTING_API_KEY=your-key
 
-# Or use a config file
+# Or use a non-secret config file. Keep the API key in the environment.
 cat > .persona-testing.yml << EOF
 provider: anthropic
 model: claude-sonnet-4-6
-browser: chromium
 screenshot_dir: ./screenshots
 report_dir: ./reports
 # Optional guardrail tuning (defaults shown)
 max_iterations: 50          # model loop cap, hard max 100
-timeout_ms: 900000          # wall-clock deadline per persona run
+timeout_ms: 900000          # AI loop deadline, starting before its first request
 request_timeout_ms: 120000  # per-API-request timeout
 max_input_tokens: 1000000   # cumulative input-token budget per run
 max_output_tokens: 64000    # cumulative output-token budget per run
@@ -272,9 +318,19 @@ max_output_tokens: 64000    # cumulative output-token budget per run
 EOF
 ```
 
-Run flags: `--persona` (repeatable), `--personas <dir>`, `--url`,
-`--output-dir`, `--screenshot-dir`, `--max-iterations`, `--timeout-ms`,
-`--allow-origin` (repeatable). Run `persona-testing --help` for details.
+Configuration fails closed: unknown keys, misspellings, unsupported `browser`
+selection, and correctly named keys with the wrong type are errors. The CLI
+currently loads `.persona-testing.yml` or `.persona-testing.yaml`. Those files
+can technically contain `api_key`, but environment variables are safer and
+take precedence. Never commit a credential-bearing config; downstream
+repositories should ignore dotted/undotted `.yml`/`.yaml` names and their
+`.local` variants.
+
+Run flags: `--invocation <file>` (required), `--persona` (repeatable),
+`--personas <dir>`, `--url`, `--output-dir`, `--screenshot-dir`,
+`--max-iterations`, `--timeout-ms`, `--allow-origin` (repeatable). Check flags:
+`--invocation <file>` (required), `--reports <dir>`, `--min-readiness`. Run
+`persona-testing --help` for details.
 
 ## Acknowledgements
 

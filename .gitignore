@@ -4,4 +4,12 @@ reports/
 screenshots/
 .env
 .persona-probe.yml
+.persona-testing.yml
+.persona-testing.yaml
+persona-testing.yml
+persona-testing.yaml
+.persona-testing.local.yml
+.persona-testing.local.yaml
+persona-testing.local.yml
+persona-testing.local.yaml
 *.tsbuildinfo

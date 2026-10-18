@@ -43,11 +43,16 @@ jobs:
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
+          # Node 24.14.0 bundles npm 11.9.0, which supports OIDC trusted
+          # publishing without downloading registry tooling in this job.
+          node-version: '24.14.0'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: package-tarball
-      # npm >= 11.5.1 is required for OIDC trusted publishing; pin the exact
-      # version instead of npm@latest so the publish toolchain is reproducible.
-      - run: npm install -g npm@11.5.1
+      - name: Verify bundled publish toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.14.0"
+          test "$(npm --version)" = "11.9.0"
       - run: npm publish ./persona-testing-*.tgz --provenance --access public

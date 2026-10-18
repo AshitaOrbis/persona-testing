@@ -7,28 +7,97 @@
  * this policy — it is enforced in code, not in the prompt.
  */
 
+import { isIP } from "node:net";
+
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
+
+const IPV4_LOOPBACK = 0x7f000000n;
+const IPV4_PRIVATE_10 = 0x0a000000n;
+const IPV4_PRIVATE_172 = 0xac100000n;
+const IPV4_PRIVATE_192 = 0xc0a80000n;
+const IPV4_LINK_LOCAL = 0xa9fe0000n;
+const IPV6_UNIQUE_LOCAL = 0xfc000000000000000000000000000000n;
+const IPV6_LINK_LOCAL = 0xfe800000000000000000000000000000n;
+
+function isInCidr(value: bigint, network: bigint, totalBits: number, prefixBits: number): boolean {
+  const shift = BigInt(totalBits - prefixBits);
+  return value >> shift === network >> shift;
+}
+
+/** Convert a Node-validated IPv4 literal to one canonical 32-bit value. */
+function parseIpv4(hostname: string): bigint | null {
+  if (isIP(hostname) !== 4) return null;
+  return hostname
+    .split(".")
+    .map(Number)
+    .reduce((value, octet) => (value << 8n) | BigInt(octet), 0n);
+}
+
+/** Convert a Node-validated IPv6 literal to one canonical 128-bit value. */
+function parseIpv6(hostname: string): bigint | null {
+  if (isIP(hostname) !== 6) return null;
+
+  const halves = hostname.split("::");
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const omitted = 8 - left.length - right.length;
+  const groups = halves.length === 2
+    ? [...left, ...Array<string>(omitted).fill("0"), ...right]
+    : left;
+
+  return groups.reduce(
+    (value, group) => (value << 16n) | BigInt(Number.parseInt(group, 16)),
+    0n,
+  );
+}
+
+function isPrivateIpv4(address: bigint): boolean {
+  return (
+    isInCidr(address, 0n, 32, 8) ||
+    isInCidr(address, IPV4_LOOPBACK, 32, 8) ||
+    isInCidr(address, IPV4_PRIVATE_10, 32, 8) ||
+    isInCidr(address, IPV4_PRIVATE_172, 32, 12) ||
+    isInCidr(address, IPV4_PRIVATE_192, 32, 16) ||
+    isInCidr(address, IPV4_LINK_LOCAL, 32, 16)
+  );
+}
 
 /** Hosts/ranges that are never allowed as EXTRA origins (--allow-origin). */
 function isPrivateOrLocalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (h === "localhost" || h.endsWith(".localhost")) return true;
-  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
   if (h.endsWith(".internal") || h.endsWith(".local")) return true;
-  // IPv4 literals
-  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    if (a === 127) return true; // loopback
-    if (a === 10) return true; // RFC1918
-    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
-    if (a === 192 && b === 168) return true; // RFC1918
-    if (a === 169 && b === 254) return true; // link-local / cloud metadata
-    if (a === 0) return true;
+
+  const ipv4 = parseIpv4(h);
+  if (ipv4 !== null) return isPrivateIpv4(ipv4);
+
+  const ipv6 = parseIpv6(h);
+  if (ipv6 === null) return false;
+  if (ipv6 === 0n || ipv6 === 1n) return true;
+
+  // IPv4-mapped IPv6 (::ffff:0:0/96) must inherit IPv4 classification.
+  if (ipv6 >> 32n === 0xffffn) {
+    return isPrivateIpv4(ipv6 & 0xffffffffn);
   }
-  // IPv6 unique-local / link-local
-  if (/^f[cd][0-9a-f]{2}:/i.test(h) || /^fe80:/i.test(h)) return true;
-  return false;
+
+  return (
+    isInCidr(ipv6, IPV6_UNIQUE_LOCAL, 128, 7) ||
+    isInCidr(ipv6, IPV6_LINK_LOCAL, 128, 10)
+  );
+}
+
+/** The sole implicit cross-origin transition: public default-port HTTP to HTTPS. */
+function canonicalUpgradeOrigin(initial: URL): string | null {
+  if (
+    initial.protocol !== "http:" ||
+    initial.port !== "" ||
+    isPrivateOrLocalHost(initial.hostname)
+  ) {
+    return null;
+  }
+  const upgraded = new URL(initial.toString());
+  upgraded.protocol = "https:";
+  return upgraded.origin;
 }
 
 export type NavigationCheck =
@@ -54,11 +123,13 @@ export class NavigationPolicy {
     this.initialUrl = initial.toString();
 
     const origins = new Set<string>([initial.origin]);
+    const canonicalUpgrade = canonicalUpgradeOrigin(initial);
+    if (canonicalUpgrade) origins.add(canonicalUpgrade);
     for (const raw of extraOrigins) {
       const u = NavigationPolicy.parseOperatorUrl(raw, "--allow-origin");
       if (isPrivateOrLocalHost(u.hostname) && u.origin !== initial.origin) {
         throw new Error(
-          `Refusing extra allowed origin "${raw}": private/localhost origins ` +
+          `Refusing extra allowed origin "${redactUrl(raw)}": private/localhost origins ` +
             `other than the target itself cannot be allowlisted.`,
         );
       }
@@ -68,21 +139,22 @@ export class NavigationPolicy {
   }
 
   /**
-   * The operator-supplied URL may itself redirect (http→https, apex→www).
-   * That redirect chain carries the operator's trust, so the landing origin
-   * is added to the allowlist. Returns the added origin, or null if it was
-   * already allowed. Throws on non-http(s) landings.
+   * Validate an initial landing without expanding the original allowlist.
+   * The only implicit redirect admitted is the canonical same-host,
+   * default-port HTTP-to-HTTPS transition established by the constructor.
    */
   allowInitialLanding(landedUrl: string): string | null {
-    const u = new URL(landedUrl);
-    if (!ALLOWED_SCHEMES.has(u.protocol)) {
-      throw new Error(
-        `Initial navigation landed on disallowed scheme "${u.protocol}" (${landedUrl})`,
-      );
+    let u: URL;
+    try {
+      u = new URL(landedUrl);
+    } catch {
+      throw new Error("Initial navigation landed on an invalid URL ([unparseable-url])");
     }
-    if (this.origins.has(u.origin)) return null;
-    this.origins.add(u.origin);
-    return u.origin;
+    if (ALLOWED_SCHEMES.has(u.protocol) && this.origins.has(u.origin)) return null;
+    throw new Error(
+      `Initial navigation blocked by policy at ${redactUrl(landedUrl)}; ` +
+        "redirect landings do not expand the configured origin allowlist.",
+    );
   }
 
   /** Validate an operator-supplied URL: must parse and be http/https. */
@@ -91,7 +163,9 @@ export class NavigationPolicy {
     try {
       u = new URL(raw);
     } catch {
-      throw new Error(`Invalid ${label} value: "${raw}" is not a valid absolute URL`);
+      throw new Error(
+        `Invalid ${label} value: "${redactUrl(raw)}" is not a valid absolute URL`,
+      );
     }
     if (!ALLOWED_SCHEMES.has(u.protocol)) {
       throw new Error(
@@ -111,7 +185,7 @@ export class NavigationPolicy {
     try {
       u = new URL(raw, currentUrl || this.initialUrl);
     } catch {
-      return { ok: false, reason: `invalid URL: ${raw}` };
+      return { ok: false, reason: `invalid URL: ${redactUrl(raw)}` };
     }
     if (!ALLOWED_SCHEMES.has(u.protocol)) {
       return {

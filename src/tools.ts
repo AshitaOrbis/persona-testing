@@ -12,10 +12,10 @@
  *   - Typed text is never echoed back into the model transcript.
  */
 
-import type { Page } from "playwright";
+import type { Frame, Page, Request, Route } from "playwright";
 import type { ToolName, ToolStats } from "./schema.js";
 import { NavigationPolicy, redactUrl } from "./policy.js";
-import { mkdirSync } from "fs";
+import { mkdirSync, rmSync } from "fs";
 import { join } from "path";
 
 /** Maximum characters of any single tool result sent to the model. */
@@ -197,6 +197,11 @@ export class PlaywrightBridge {
   private runId: string;
   private screenshotCounter = 0;
   readonly screenshots: string[] = [];
+  private readonly boundaryReady: Promise<void>;
+  private policyViolationEpoch = 0;
+  private lastPolicyViolation: string | null = null;
+  private recoveringPrimaryPage = false;
+  private readonly policyViolationListeners = new Set<(message: string) => void>();
 
   private totalCalls = 0;
   private errorCount = 0;
@@ -210,6 +215,16 @@ export class PlaywrightBridge {
     this.policy = options.policy;
     this.runId = options.runId;
     mkdirSync(this.screenshotDir, { recursive: true });
+
+    // Install the policy on the BrowserContext before any bridge navigation.
+    // This covers redirects and every Page created by target=_blank or
+    // window.open(), rather than trusting calls made through this.page alone.
+    this.attachPageGuard(this.page, false);
+    const context = this.page.context();
+    context.on("page", (newPage) => this.attachPageGuard(newPage, true));
+    this.boundaryReady = context.route("**/*", (route) =>
+      this.enforceNavigationRequest(route),
+    );
   }
 
   get stats(): ToolStats {
@@ -221,27 +236,121 @@ export class PlaywrightBridge {
     };
   }
 
+  /** Apply the same final-URL predicate to the primary page and every popup. */
+  private attachPageGuard(page: Page, unexpected: boolean): void {
+    page.on("framenavigated", (frame: Frame) => {
+      if (frame !== page.mainFrame()) return;
+      const committedUrl = page.url();
+      if (committedUrl === "about:blank" || this.policy.isAllowedUrl(committedUrl)) {
+        return;
+      }
+
+      this.recordPolicyViolation("committed top-level navigation", committedUrl);
+      if (page === this.page) {
+        void this.recoverPrimaryPage();
+      } else {
+        void page.close({ runBeforeUnload: false }).catch(() => undefined);
+      }
+    });
+
+    if (unexpected) {
+      // The run owns exactly one Page. A popup is never silently adopted,
+      // even when it begins at about:blank and navigates only after a delay.
+      this.recordPolicyViolation("unexpected popup");
+      void page.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+  }
+
+  /** Block every disallowed top-level document request, including redirects. */
+  private async enforceNavigationRequest(route: Route): Promise<void> {
+    const request = route.request();
+    if (!this.isTopLevelDocumentRequest(request)) {
+      await route.continue();
+      return;
+    }
+
+    const target = request.url();
+    if (this.policy.isAllowedUrl(target)) {
+      await route.continue();
+      return;
+    }
+
+    this.recordPolicyViolation("top-level navigation request", target);
+    await route.abort("blockedbyclient");
+
+    const requestPage = request.frame().page();
+    if (requestPage !== this.page) {
+      await requestPage.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+  }
+
+  private isTopLevelDocumentRequest(request: Request): boolean {
+    if (!request.isNavigationRequest() || request.resourceType() !== "document") {
+      return false;
+    }
+    try {
+      const frame = request.frame();
+      return frame === frame.page().mainFrame();
+    } catch {
+      return false;
+    }
+  }
+
+  private recordPolicyViolation(action: string, rawUrl?: string): string {
+    this.policyViolationEpoch++;
+    this.policyBlockCount++;
+    const target = rawUrl ? ` to ${redactUrl(rawUrl)}` : "";
+    this.lastPolicyViolation =
+      `Policy: blocked ${action}${target}; the destination is outside the ` +
+      "original allowed origins and no result from it was retained.";
+    for (const listener of [...this.policyViolationListeners]) {
+      listener(this.lastPolicyViolation);
+    }
+    return this.lastPolicyViolation;
+  }
+
+  private async recoverPrimaryPage(): Promise<void> {
+    if (this.recoveringPrimaryPage) return;
+    this.recoveringPrimaryPage = true;
+    try {
+      await this.page.goto(this.policy.initialUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+    } catch {
+      this.navigationFailures++;
+    } finally {
+      this.recoveringPrimaryPage = false;
+    }
+  }
+
   /**
    * Programmatic initial navigation to the operator-supplied URL.
    * Called by the harness before the model loop starts, so the full
    * (possibly secret-bearing) URL never needs to appear in the prompt.
    */
   async initialNavigate(fullUrl: string): Promise<void> {
+    const startEpoch = this.policyViolationEpoch;
     try {
+      await this.boundaryReady;
+      const earlyCheck = this.policy.checkModelNavigation(fullUrl, this.policy.initialUrl);
+      if (!earlyCheck.ok) {
+        throw new Error(`Navigation blocked by policy: ${earlyCheck.reason}`);
+      }
       await this.page.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await this.page.waitForTimeout(1000); // let SPA hydrate
+      this.policy.allowInitialLanding(this.page.url());
+
+      const drift = await this.enforceOrigin("initial navigation landing");
+      if (drift || this.policyViolationEpoch !== startEpoch) {
+        throw new Error(drift ?? this.lastPolicyViolation ?? "navigation blocked by policy");
+      }
     } catch (err) {
       this.navigationFailures++;
-      throw err;
-    }
-    // The operator's URL may legitimately redirect (http→https, apex→www).
-    // Trust the operator's redirect chain: widen the allowlist to the
-    // landing origin and say so.
-    const added = this.policy.allowInitialLanding(this.page.url());
-    if (added) {
-      console.warn(
-        `Note: target URL redirected to ${added}; added it to the allowed origins.`,
-      );
+      if (this.policyViolationEpoch !== startEpoch && this.lastPolicyViolation) {
+        throw new Error(`[NAVIGATION_BLOCKED] action=initial_navigate: ${this.lastPolicyViolation}`);
+      }
+      throw sanitizeBridgeError(err, "initial_navigate", fullUrl);
     }
   }
 
@@ -252,7 +361,11 @@ export class PlaywrightBridge {
   async dispatch(name: ToolName, input: Record<string, unknown>): Promise<string> {
     this.totalCalls++;
     let result: string;
+    let operationEpoch = this.policyViolationEpoch;
+    const screenshotCount = this.screenshots.length;
+    const attemptedUrl = this.resolveAttemptedNavigation(name, input);
     try {
+      await this.boundaryReady;
       // The page can leave the allowed origins WITHOUT a tool action — e.g.
       // a <meta refresh> or a timed window.location redirect planted by the
       // tested page. Re-check before every tool call so read-only tools
@@ -261,15 +374,79 @@ export class PlaywrightBridge {
       if (drift) {
         result = drift;
       } else {
-        result = await this.dispatchInner(name, input);
+        operationEpoch = this.policyViolationEpoch;
+        let notifyViolation!: (message: string) => void;
+        const violationPromise = new Promise<{
+          kind: "violation";
+          message: string;
+        }>((resolve) => {
+          notifyViolation = (message) => resolve({ kind: "violation", message });
+        });
+        this.policyViolationListeners.add(notifyViolation);
+        const operationPromise = Promise.resolve().then(() =>
+          this.dispatchInner(name, input),
+        );
+        let outcome:
+          | { kind: "result"; value: string }
+          | { kind: "violation"; message: string };
+        try {
+          outcome = await Promise.race([
+            operationPromise.then((value) => ({ kind: "result" as const, value })),
+            violationPromise,
+          ]);
+        } finally {
+          this.policyViolationListeners.delete(notifyViolation);
+        }
+
+        if (outcome.kind === "violation") {
+          this.discardScreenshotsSince(screenshotCount);
+          // The Playwright call may settle later. Swallow its result/error and
+          // repeat cleanup in case a screenshot was written after the race.
+          void operationPromise.then(
+            () => this.discardScreenshotsSince(screenshotCount),
+            () => this.discardScreenshotsSince(screenshotCount),
+          );
+          result = outcome.message;
+        } else {
+          result = outcome.value;
+          const postOperationDrift = await this.enforceOrigin(`${name} (post-operation)`);
+          if (postOperationDrift || this.policyViolationEpoch !== operationEpoch) {
+            this.discardScreenshotsSince(screenshotCount);
+            result =
+              postOperationDrift ??
+              this.lastPolicyViolation ??
+              "Policy: navigation changed during the tool operation; its result was discarded.";
+          }
+        }
       }
     } catch (err) {
-      this.errorCount++;
-      if (name === "navigate") this.navigationFailures++;
-      const msg = err instanceof Error ? err.message : String(err);
-      result = `Error (${name}): ${msg}`;
+      this.discardScreenshotsSince(screenshotCount);
+      if (this.policyViolationEpoch !== operationEpoch && this.lastPolicyViolation) {
+        result = this.lastPolicyViolation;
+      } else {
+        this.errorCount++;
+        if (name === "navigate") this.navigationFailures++;
+        result = sanitizeBridgeError(err, name, attemptedUrl).message;
+      }
     }
     return truncateResult(result);
+  }
+
+  private resolveAttemptedNavigation(
+    name: ToolName,
+    input: Record<string, unknown>,
+  ): string | undefined {
+    if (name !== "navigate" || typeof input.url !== "string") return undefined;
+    try {
+      return new URL(input.url, this.page.url() || this.policy.initialUrl).toString();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private discardScreenshotsSince(count: number): void {
+    const discarded = this.screenshots.splice(count);
+    for (const filepath of discarded) rmSync(filepath, { force: true });
   }
 
   private async dispatchInner(name: ToolName, input: Record<string, unknown>): Promise<string> {
@@ -384,8 +561,14 @@ export class PlaywrightBridge {
     const filename = `${this.personaSlug}-${this.runId}-${counter}-${safeName}.png`;
     const filepath = join(this.screenshotDir, filename);
 
-    await this.page.screenshot({ path: filepath, fullPage: false });
     this.screenshots.push(filepath);
+    try {
+      await this.page.screenshot({ path: filepath, fullPage: false });
+    } catch (error) {
+      this.screenshots.pop();
+      rmSync(filepath, { force: true });
+      throw error;
+    }
     return `Screenshot saved: ${filepath}`;
   }
 
@@ -426,40 +609,44 @@ export class PlaywrightBridge {
   }
 
   /**
-   * If an action caused the page to leave the allowed origins (link click,
-   * form submit, redirect), navigate back and report the policy violation.
-   * Returns a message string when an escape was reverted, null otherwise.
+   * Re-check the final committed URL before and after every page operation.
+   * BrowserContext routing is the first boundary; this is the result-discard
+   * boundary for navigations that commit despite request interception.
    */
   private async enforceOrigin(action: string): Promise<string | null> {
     const current = this.page.url();
     if (current === "about:blank" || this.policy.isAllowedUrl(current)) return null;
 
-    this.policyBlockCount++;
-    const offending = redactUrl(current);
-    try {
-      await this.page.goBack({ waitUntil: "domcontentloaded", timeout: 15_000 });
-      if (!this.policy.isAllowedUrl(this.page.url())) {
-        await this.page.goto(this.policy.initialUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        });
-      }
-    } catch {
-      try {
-        await this.page.goto(this.policy.initialUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        });
-      } catch {
-        this.navigationFailures++;
-      }
-    }
-    return (
-      `Policy: the page moved to ${offending} (via ${action}), which is ` +
-      `outside the allowed origins. The browser was returned to the target ` +
-      `application. Do not attempt to leave the target site.`
-    );
+    const violation = this.recordPolicyViolation(action, current);
+    await this.recoverPrimaryPage();
+    return violation;
   }
+}
+
+const URL_IN_ERROR_TEXT = /https?:\/\/[^\s"'<>]+/giu;
+
+/**
+ * The sole exception-to-text boundary. Navigation errors deliberately drop
+ * raw Playwright call logs; other tool errors retain only URL-sanitized text.
+ */
+function sanitizeBridgeError(
+  error: unknown,
+  action: string,
+  attemptedUrl?: string,
+): Error {
+  const rawClass = error instanceof Error ? error.name : "Error";
+  const errorClass = /^[A-Za-z][A-Za-z0-9]*Error$/.test(rawClass) ? rawClass : "Error";
+  const navigation = action === "navigate" || action === "initial_navigate";
+  const code = navigation ? "NAVIGATION_FAILED" : "TOOL_ACTION_FAILED";
+  const target = attemptedUrl ? ` target=${redactUrl(attemptedUrl)}` : "";
+
+  if (navigation) {
+    return new Error(`[${code}] action=${action} class=${errorClass}${target}`);
+  }
+
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const safeMessage = rawMessage.replace(URL_IN_ERROR_TEXT, (url) => redactUrl(url));
+  return new Error(`[${code}] action=${action} class=${errorClass}: ${safeMessage}`);
 }
 
 function clampTimeout(raw: unknown): number | undefined {

@@ -7,21 +7,63 @@
  * cannot leak into a CI gate.
  */
 
-import { writeFileSync, mkdirSync } from "fs";
-import { randomBytes } from "crypto";
+import { existsSync, writeFileSync, mkdirSync } from "fs";
+import { createHash, randomBytes } from "crypto";
 import { join, basename } from "path";
 import type { ProbeResult, RunManifest } from "./schema.js";
 
 export const MANIFEST_FILENAME = "run-manifest.json";
 
 /**
- * Slugify a persona name for use in filenames.
+ * Build a deterministic, collision-resistant persona identity for filenames.
+ *
+ * The readable prefix is deliberately not trusted for uniqueness. The digest
+ * covers the NFC-normalized original name, and the fallback keeps names that
+ * contain no ASCII characters from collapsing to an empty basename.
  */
 export function slugify(name: string): string {
-  return name
+  const normalizedName = name.normalize("NFC");
+  const readable = normalizedName
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/^-|-$/g, "")
+    .slice(0, 64);
+  const digest = createHash("sha256")
+    .update(normalizedName, "utf8")
+    .digest("hex")
+    .slice(0, 12);
+  return `${readable || "persona"}-${digest}`;
+}
+
+export interface PersonaIdentityInput {
+  name: string;
+  source?: string;
+}
+
+/**
+ * Compute every output identity before probes begin and reject any residual
+ * collision. Callers should pass source paths so an error names both inputs.
+ */
+export function preflightPersonaIdentities(
+  personas: readonly PersonaIdentityInput[],
+): string[] {
+  const seen = new Map<string, { input: PersonaIdentityInput; index: number }>();
+
+  return personas.map((input, index) => {
+    const identity = slugify(input.name);
+    const previous = seen.get(identity);
+    if (previous) {
+      const previousLabel = previous.input.source ?? `input #${previous.index + 1}`;
+      const currentLabel = input.source ?? `input #${index + 1}`;
+      throw new Error(
+        `Persona output identity collision "${identity}" between ` +
+          `"${previous.input.name}" (${previousLabel}) and ` +
+          `"${input.name}" (${currentLabel})`,
+      );
+    }
+    seen.set(identity, { input, index });
+    return identity;
+  });
 }
 
 /**
@@ -52,14 +94,24 @@ export function saveReport(
   const jsonPath = join(reportDir, `${baseName}.json`);
   const mdPath = join(reportDir, `${baseName}.md`);
 
+  const occupiedPaths = [jsonPath, mdPath].filter((path) => existsSync(path));
+  if (occupiedPaths.length > 0) {
+    throw new Error(
+      `Report output collision: refusing to overwrite existing path(s): ` +
+        occupiedPaths.join(", "),
+    );
+  }
+
   // JSON report (structured data for CI/CD)
   const jsonData = { ...result, run_id: runId };
   delete (jsonData as any).report_markdown; // Don't duplicate markdown in JSON
-  writeFileSync(jsonPath, JSON.stringify(jsonData, null, 2) + "\n");
+  writeFileSync(jsonPath, JSON.stringify(jsonData, null, 2) + "\n", {
+    flag: "wx",
+  });
 
   // Markdown report (human-readable)
   const md = buildMarkdownReport(result);
-  writeFileSync(mdPath, md);
+  writeFileSync(mdPath, md, { flag: "wx" });
 
   return { jsonPath, mdPath };
 }
@@ -73,13 +125,45 @@ export function writeManifest(
   runId: string,
   url: string,
   jsonPaths: string[],
+  requestedPersonas = jsonPaths.length,
 ): string {
   mkdirSync(reportDir, { recursive: true });
-  const manifest: RunManifest = {
+  const reportBasenames = jsonPaths.map((path) => basename(path));
+  const uniqueBasenames = new Set(reportBasenames);
+
+  if (uniqueBasenames.size !== reportBasenames.length) {
+    throw new Error(
+      `Report reconciliation failed: manifest report paths must be unique ` +
+        `(${uniqueBasenames.size} unique for ${reportBasenames.length} entries)`,
+    );
+  }
+
+  const missingPaths = jsonPaths.filter((path) => !existsSync(path));
+  if (missingPaths.length > 0) {
+    throw new Error(
+      `Report reconciliation failed: ${missingPaths.length} report path(s) do not exist: ` +
+        missingPaths.join(", "),
+    );
+  }
+
+  const reportsWritten = uniqueBasenames.size;
+  if (requestedPersonas !== reportsWritten) {
+    throw new Error(
+      `Report count mismatch: requested ${requestedPersonas} persona(s), ` +
+        `found ${reportsWritten} report(s)`,
+    );
+  }
+
+  const manifest: RunManifest & {
+    requested_personas: number;
+    reports_written: number;
+  } = {
     run_id: runId,
     created: new Date().toISOString(),
     url,
-    reports: jsonPaths.map((p) => basename(p)),
+    requested_personas: requestedPersonas,
+    reports_written: reportsWritten,
+    reports: reportBasenames,
   };
   const manifestPath = join(reportDir, MANIFEST_FILENAME);
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");

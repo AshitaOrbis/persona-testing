@@ -16,7 +16,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { TOOL_DEFINITIONS, type PlaywrightBridge } from "./tools.js";
-import type { ToolName } from "./schema.js";
+import type { ExecutionStatus, StopReason, ToolName } from "./schema.js";
 
 // ---------------------------------------------------------------------------
 // Provider interface
@@ -27,9 +27,13 @@ export interface LoopResult {
   inputTokens: number;
   outputTokens: number;
   iterations: number;
-  /** Why the loop ended: "completed" | "max_iterations" | "deadline" | "token_budget" */
-  stopReason: string;
+  /** A limit stop is terminal and must never be treated as a completed gate run. */
+  executionStatus: ExecutionStatus;
+  /** Why the loop ended. */
+  stopReason: StopReason;
 }
+
+export type LoopStopReason = StopReason;
 
 export interface ProviderOptions {
   apiKey: string;
@@ -59,6 +63,7 @@ const DEFAULT_DEADLINE_MS = 15 * 60 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_INPUT_TOKENS = 1_000_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
+const NORMAL_RESPONSE_MAX_TOKENS = 16_384;
 
 function clampIterations(n: number | undefined): number {
   if (n === undefined || !Number.isFinite(n)) return DEFAULT_MAX_ITERATIONS;
@@ -79,18 +84,116 @@ class RunBudget {
     this.maxOutput = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   }
 
+  remainingTimeMs(): number {
+    return Math.max(0, this.deadline - Date.now());
+  }
+
+  remainingInputTokens(): number {
+    return Math.max(0, this.maxInput - this.inputTokens);
+  }
+
+  remainingOutputTokens(): number {
+    return Math.max(0, this.maxOutput - this.outputTokens);
+  }
+
+  recordUsage(inputTokens: number, outputTokens: number): void {
+    this.inputTokens += Math.max(0, inputTokens);
+    this.outputTokens += Math.max(0, outputTokens);
+  }
+
   /** Returns a stop reason when a budget is exhausted, null otherwise. */
-  exceeded(): string | null {
-    if (Date.now() > this.deadline) return "deadline";
-    if (this.inputTokens > this.maxInput || this.outputTokens > this.maxOutput) {
+  exceeded(): "deadline" | "token_budget" | null {
+    if (this.remainingTimeMs() <= 0) return "deadline";
+    if (
+      this.inputTokens >= this.maxInput ||
+      this.outputTokens >= this.maxOutput
+    ) {
       return "token_budget";
     }
     return null;
   }
+
+  /**
+   * Refuse a request unless its conservative input estimate and output cap fit
+   * inside the remaining run budgets.
+   */
+  prepareRequest(
+    payload: unknown,
+    requestedOutputTokens: number,
+    requestTimeoutMs: number,
+  ):
+    | { stopReason: "deadline" | "token_budget" }
+    | { maxOutputTokens: number; timeoutMs: number } {
+    const exceeded = this.exceeded();
+    if (exceeded) return { stopReason: exceeded };
+
+    // A token cannot encode less than one UTF-8 byte. The serialized request
+    // byte length is therefore a deliberately conservative upper bound.
+    const estimatedInputTokens = Buffer.byteLength(JSON.stringify(payload), "utf8");
+    if (estimatedInputTokens > this.remainingInputTokens()) {
+      return { stopReason: "token_budget" };
+    }
+
+    const maxOutputTokens = Math.min(
+      requestedOutputTokens,
+      this.remainingOutputTokens(),
+    );
+    if (maxOutputTokens < 1) return { stopReason: "token_budget" };
+
+    const timeoutMs = Math.min(requestTimeoutMs, this.remainingTimeMs());
+    if (timeoutMs < 1) return { stopReason: "deadline" };
+
+    return { maxOutputTokens, timeoutMs };
+  }
 }
 
-const WRAP_UP_MESSAGE = (reason: string) =>
-  `The run ${reason} limit has been reached. Please produce the ## Structured Assessment block now with what you have observed so far.`;
+function exhaustedResult(
+  budget: RunBudget,
+  iterations: number,
+  stopReason: Exclude<LoopStopReason, "completed" | "output_truncated">,
+): LoopResult {
+  return {
+    text:
+      "## Structured Assessment\n\n" +
+      "### Readiness Score: 0%\n\n" +
+      "### Critical Bugs\n\n" +
+      `BUDGET_EXHAUSTED: evaluation is INCONCLUSIVE (${stopReason}). ` +
+      "This is an execution guardrail state, not an application defect, and cannot pass the deployment gate.\n",
+    inputTokens: budget.inputTokens,
+    outputTokens: budget.outputTokens,
+    iterations,
+    executionStatus: "BUDGET_EXHAUSTED",
+    stopReason,
+  };
+}
+
+/**
+ * The provider cut the response off at its output cap. Whatever text arrived is
+ * kept for the report, but the run is not a finished evaluation: it is never
+ * labelled completed, so it cannot pass the gate, and no cut-off tool call runs.
+ */
+function truncatedResult(budget: RunBudget, iterations: number, text: string): LoopResult {
+  return {
+    text,
+    inputTokens: budget.inputTokens,
+    outputTokens: budget.outputTokens,
+    iterations,
+    executionStatus: "TRUNCATED",
+    stopReason: "output_truncated",
+  };
+}
+
+function requestAbortOptions(timeoutMs: number): {
+  options: { timeout: number; signal: AbortSignal };
+  clear: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    options: { timeout: timeoutMs, signal: controller.signal },
+    clear: () => clearTimeout(timer),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Anthropic provider
@@ -134,26 +237,37 @@ export class AnthropicProvider implements AIProvider {
 
     const budget = new RunBudget(this.options);
     let iterations = 0;
-    let stopReason = "max_iterations";
 
     while (iterations < this.maxIterations) {
       const exceeded = budget.exceeded();
-      if (exceeded) {
-        stopReason = exceeded;
-        break;
-      }
+      if (exceeded) return exhaustedResult(budget, iterations, exceeded);
       iterations++;
+
+      const requestBody = {
+        model: this.model,
+        max_tokens: NORMAL_RESPONSE_MAX_TOKENS,
+        system: systemPrompt,
+        tools,
+        messages,
+      };
+      const requestBudget = budget.prepareRequest(
+        requestBody,
+        NORMAL_RESPONSE_MAX_TOKENS,
+        this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      );
+      if ("stopReason" in requestBudget) {
+        return exhaustedResult(budget, iterations - 1, requestBudget.stopReason);
+      }
+      requestBody.max_tokens = requestBudget.maxOutputTokens;
+      const abort = requestAbortOptions(requestBudget.timeoutMs);
 
       let response: Anthropic.Message;
       try {
-        response = await this.client.messages.create({
-          model: this.model,
-          max_tokens: 16384,
-          system: systemPrompt,
-          tools,
-          messages,
-        });
+        response = await this.client.messages.create(requestBody, abort.options);
       } catch (err: any) {
+        if (budget.remainingTimeMs() <= 0) {
+          return exhaustedResult(budget, iterations, "deadline");
+        }
         // Token overflow recovery: ask for just the assessment
         if (err?.status === 400 && err?.message?.includes("token")) {
           messages.push({
@@ -164,10 +278,18 @@ export class AnthropicProvider implements AIProvider {
           continue;
         }
         throw err;
+      } finally {
+        abort.clear();
       }
 
-      budget.inputTokens += response.usage?.input_tokens ?? 0;
-      budget.outputTokens += response.usage?.output_tokens ?? 0;
+      budget.recordUsage(
+        response.usage?.input_tokens ?? 0,
+        response.usage?.output_tokens ?? 0,
+      );
+      const responseExceeded = budget.exceeded();
+      if (responseExceeded) {
+        return exhaustedResult(budget, iterations, responseExceeded);
+      }
 
       // Check for tool use blocks
       const toolBlocks = response.content.filter(
@@ -176,6 +298,10 @@ export class AnthropicProvider implements AIProvider {
       const textBlocks = response.content.filter(
         (b): b is Anthropic.TextBlock => b.type === "text",
       );
+
+      if (response.stop_reason === "max_tokens") {
+        return truncatedResult(budget, iterations, textBlocks.map((b) => b.text).join("\n"));
+      }
 
       // If no tool calls, we're done
       if (toolBlocks.length === 0 || response.stop_reason === "end_turn") {
@@ -188,6 +314,7 @@ export class AnthropicProvider implements AIProvider {
             inputTokens: budget.inputTokens,
             outputTokens: budget.outputTokens,
             iterations,
+            executionStatus: "COMPLETED",
             stopReason: "completed",
           };
         }
@@ -199,6 +326,7 @@ export class AnthropicProvider implements AIProvider {
             inputTokens: budget.inputTokens,
             outputTokens: budget.outputTokens,
             iterations,
+            executionStatus: "COMPLETED",
             stopReason: "completed",
           };
         }
@@ -207,10 +335,17 @@ export class AnthropicProvider implements AIProvider {
       // Dispatch tool calls
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
       for (const block of toolBlocks) {
+        const beforeTool = budget.exceeded();
+        if (beforeTool) return exhaustedResult(budget, iterations, beforeTool);
+
         const result = await bridge.dispatch(
           block.name as ToolName,
           (block.input ?? {}) as Record<string, unknown>,
         );
+
+        const afterTool = budget.exceeded();
+        if (afterTool) return exhaustedResult(budget, iterations, afterTool);
+
         toolResults.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -225,6 +360,7 @@ export class AnthropicProvider implements AIProvider {
             inputTokens: budget.inputTokens,
             outputTokens: budget.outputTokens,
             iterations,
+            executionStatus: "COMPLETED",
             stopReason: "completed",
           };
         }
@@ -235,34 +371,7 @@ export class AnthropicProvider implements AIProvider {
       messages.push({ role: "user", content: toolResults });
     }
 
-    // Budget or iteration limit hit — ask for final output
-    messages.push({
-      role: "user",
-      content: WRAP_UP_MESSAGE(stopReason === "max_iterations" ? "iteration" : stopReason),
-    });
-
-    const finalResponse = await this.client.messages.create({
-      model: this.model,
-      max_tokens: 8192,
-      system: systemPrompt,
-      messages,
-    });
-
-    budget.inputTokens += finalResponse.usage?.input_tokens ?? 0;
-    budget.outputTokens += finalResponse.usage?.output_tokens ?? 0;
-
-    const finalText = finalResponse.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-
-    return {
-      text: finalText,
-      inputTokens: budget.inputTokens,
-      outputTokens: budget.outputTokens,
-      iterations,
-      stopReason,
-    };
+    return exhaustedResult(budget, iterations, "max_iterations");
   }
 }
 
@@ -307,31 +416,59 @@ export class OpenAIProvider implements AIProvider {
 
     const budget = new RunBudget(this.options);
     let iterations = 0;
-    let stopReason = "max_iterations";
 
     while (iterations < this.maxIterations) {
       const exceeded = budget.exceeded();
-      if (exceeded) {
-        stopReason = exceeded;
-        break;
-      }
+      if (exceeded) return exhaustedResult(budget, iterations, exceeded);
       iterations++;
 
-      const response = await this.client.chat.completions.create({
+      const requestBody: OpenAI.ChatCompletionCreateParamsNonStreaming = {
         model: this.model,
-        max_tokens: 16384,
+        max_tokens: NORMAL_RESPONSE_MAX_TOKENS,
         tools,
         messages,
-      });
+      };
+      const requestBudget = budget.prepareRequest(
+        requestBody,
+        NORMAL_RESPONSE_MAX_TOKENS,
+        this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      );
+      if ("stopReason" in requestBudget) {
+        return exhaustedResult(budget, iterations - 1, requestBudget.stopReason);
+      }
+      requestBody.max_tokens = requestBudget.maxOutputTokens;
+      const abort = requestAbortOptions(requestBudget.timeoutMs);
+
+      let response: OpenAI.ChatCompletion;
+      try {
+        response = await this.client.chat.completions.create(requestBody, abort.options);
+      } catch (error) {
+        if (budget.remainingTimeMs() <= 0) {
+          return exhaustedResult(budget, iterations, "deadline");
+        }
+        throw error;
+      } finally {
+        abort.clear();
+      }
 
       const choice = response.choices[0];
       if (!choice) throw new Error("No response from OpenAI");
 
-      budget.inputTokens += response.usage?.prompt_tokens ?? 0;
-      budget.outputTokens += response.usage?.completion_tokens ?? 0;
+      budget.recordUsage(
+        response.usage?.prompt_tokens ?? 0,
+        response.usage?.completion_tokens ?? 0,
+      );
+      const responseExceeded = budget.exceeded();
+      if (responseExceeded) {
+        return exhaustedResult(budget, iterations, responseExceeded);
+      }
 
       const assistantMsg = choice.message;
       messages.push(assistantMsg);
+
+      if (choice.finish_reason === "length") {
+        return truncatedResult(budget, iterations, assistantMsg.content || "");
+      }
 
       // No tool calls — done
       if (!assistantMsg.tool_calls?.length || choice.finish_reason === "stop") {
@@ -340,12 +477,16 @@ export class OpenAIProvider implements AIProvider {
           inputTokens: budget.inputTokens,
           outputTokens: budget.outputTokens,
           iterations,
+          executionStatus: "COMPLETED",
           stopReason: "completed",
         };
       }
 
       // Dispatch tool calls
       for (const toolCall of assistantMsg.tool_calls) {
+        const beforeTool = budget.exceeded();
+        if (beforeTool) return exhaustedResult(budget, iterations, beforeTool);
+
         let input: Record<string, unknown> | null = null;
         try {
           const parsed = JSON.parse(toolCall.function.arguments || "{}");
@@ -358,12 +499,20 @@ export class OpenAIProvider implements AIProvider {
 
         let result: string;
         if (input === null) {
-          result =
-            "Error: malformed tool arguments (not valid JSON object). " +
-            "Retry the tool call with valid JSON arguments.";
+          // Route malformed provider calls through the bridge so they enter
+          // the same call-level evidence stream and health accounting as all
+          // other attempted tools. The sentinel can never count as an
+          // observation or interaction.
+          result = await bridge.dispatch(
+            "__provider_malformed_tool_call__" as ToolName,
+            {},
+          );
         } else {
           result = await bridge.dispatch(toolCall.function.name as ToolName, input);
         }
+
+        const afterTool = budget.exceeded();
+        if (afterTool) return exhaustedResult(budget, iterations, afterTool);
 
         messages.push({
           role: "tool",
@@ -373,28 +522,7 @@ export class OpenAIProvider implements AIProvider {
       }
     }
 
-    // Budget or iteration limit hit
-    messages.push({
-      role: "user",
-      content: WRAP_UP_MESSAGE(stopReason === "max_iterations" ? "iteration" : stopReason),
-    });
-
-    const finalResponse = await this.client.chat.completions.create({
-      model: this.model,
-      max_tokens: 8192,
-      messages,
-    });
-
-    budget.inputTokens += finalResponse.usage?.prompt_tokens ?? 0;
-    budget.outputTokens += finalResponse.usage?.completion_tokens ?? 0;
-
-    return {
-      text: finalResponse.choices[0]?.message.content || "",
-      inputTokens: budget.inputTokens,
-      outputTokens: budget.outputTokens,
-      iterations,
-      stopReason,
-    };
+    return exhaustedResult(budget, iterations, "max_iterations");
   }
 }
 
